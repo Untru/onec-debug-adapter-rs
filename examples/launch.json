@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "1C: Attach to debug server",
+      "type": "onec-rs",
+      "request": "attach",
+      "debugServerHost": "localhost",
+      "debugServerPort": 1550
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+[package]
+name = "onec-debug-adapter"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Native cross-platform Debug Adapter Protocol adapter for 1C:Enterprise"
+license = "MIT"
+repository = "https://github.com/Untru/onec-debug-adapter-rs"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+ureq = "3.0"
+
+[dev-dependencies]
+assert_matches = "1.5"
+
+[lints.rust]
+unsafe_code = "forbid"
