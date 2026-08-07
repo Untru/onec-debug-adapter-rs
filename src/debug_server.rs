@@ -12,6 +12,8 @@ use uuid::Uuid;
 
 const RDBG_REQUEST_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse";
 const AUTO_ATTACH_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugAutoAttach";
+const BREAKPOINTS_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBreakpoints";
+const DEBUG_BASE_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBaseData";
 
 /// A successfully registered 1C Debug UI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -534,7 +536,7 @@ fn breakpoints_request(session: &DebugUiSession, modules: &[ModuleBreakpoints]) 
                 })
                 .collect::<String>();
             format!(
-                "<moduleBPInfo xmlns=\"http://v8.1c.ru/8.3/debugger/debugBreakpoints\"><id><type>{module_type}</type><URL></URL><extensionName>{}</extensionName><objectID>{}</objectID><propertyID>{}</propertyID><extId>0</extId><version></version></id>{breakpoints}</moduleBPInfo>",
+                "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id xmlns=\"{DEBUG_BASE_NAMESPACE}\"><type>{module_type}</type><URL></URL><extensionName>{}</extensionName><objectID>{}</objectID><propertyID>{}</propertyID><extId>0</extId><version></version></id>{breakpoints}</moduleBPInfo>",
                 xml_escape(&module.extension_name),
                 xml_escape(&module.object_id),
                 xml_escape(&module.property_id),
@@ -1194,7 +1196,9 @@ mod tests {
         );
 
         assert!(xml.contains("<bpWorkspace>"));
-        assert!(xml.contains("<type>ConfigModule</type>"));
+        assert!(xml.contains(&format!(
+            "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id xmlns=\"{DEBUG_BASE_NAMESPACE}\"><type>ConfigModule</type>"
+        )));
         assert!(xml.contains("<line>42</line>"));
         assert!(xml.contains("<condition>A &lt; 3</condition>"));
         assert!(xml.contains("<hitCount>5</hitCount>"));
