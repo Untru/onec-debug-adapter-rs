@@ -12,8 +12,10 @@ use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, stderr};
 use std::path::PathBuf;
+use std::process::{Child, Command};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -23,6 +25,7 @@ struct Adapter {
     next_sequence: u64,
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
+    debuggee: Option<Child>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
     call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
@@ -38,8 +41,97 @@ struct ConnectionArguments {
     info_base: Option<String>,
     info_base_alias: Option<String>,
     root_project: Option<String>,
+    platform_path: Option<String>,
+    platform_version: Option<String>,
     extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
+}
+
+fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Result<Child> {
+    let platform_path = arguments
+        .platform_path
+        .as_deref()
+        .context("launch requires platformPath")?;
+    let info_base = arguments
+        .info_base
+        .as_deref()
+        .context("launch requires infoBase")?;
+    let platform_bin = platform_bin(
+        &PathBuf::from(platform_path),
+        arguments.platform_version.as_deref(),
+    )?;
+    let executable = platform_bin.join(if cfg!(windows) { "1cv8c.exe" } else { "1cv8c" });
+    if !executable.is_file() {
+        anyhow::bail!(
+            "1C client executable was not found at {}",
+            executable.display()
+        );
+    }
+    Command::new(&executable)
+        .args([
+            "/IBName",
+            info_base,
+            "/TCOMP",
+            "-SDC",
+            "/DisableStartupMessages",
+            "/DisplayPerformance",
+            "/TechnicalSpecialistMode",
+            "/DEBUG",
+            "-http",
+            "-attach",
+            "/DEBUGGERURL",
+            &format!("http://{}", server.endpoint().trim_end_matches("/e1crdbg")),
+            "/O",
+            "Normal",
+        ])
+        .spawn()
+        .with_context(|| format!("cannot start 1C client {}", executable.display()))
+}
+
+fn platform_bin(platform_path: &PathBuf, requested_version: Option<&str>) -> Result<PathBuf> {
+    let executable_name = if cfg!(windows) { "1cv8c.exe" } else { "1cv8c" };
+    if platform_path.join(executable_name).is_file() {
+        return Ok(platform_path.clone());
+    }
+    let mut versions = fs::read_dir(platform_path)
+        .with_context(|| format!("cannot read platformPath {}", platform_path.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .into_string()
+                .ok()
+                .map(|name| (name, entry.path()))
+        })
+        .filter(|(name, _)| name.split('.').all(|part| part.parse::<u32>().is_ok()))
+        .collect::<Vec<_>>();
+    versions.sort_by_key(|entry| std::cmp::Reverse(version_key(&entry.0)));
+    let selected = match requested_version.filter(|version| !version.eq_ignore_ascii_case("latest"))
+    {
+        Some(version) => versions
+            .into_iter()
+            .find(|(name, _)| name == version)
+            .map(|(_, path)| path)
+            .with_context(|| format!("1C platform version {version} was not found"))?,
+        None => versions
+            .into_iter()
+            .next()
+            .map(|(_, path)| path)
+            .context("platformPath contains no 1C version directories")?,
+    };
+    Ok(if cfg!(windows) {
+        selected.join("bin")
+    } else {
+        selected
+    })
+}
+
+fn version_key(version: &str) -> Vec<u32> {
+    version
+        .split('.')
+        .map(|part| part.parse().unwrap_or_default())
+        .collect()
 }
 
 impl Adapter {
@@ -68,7 +160,7 @@ impl Adapter {
                     }],
                 }),
             )],
-            "launch" | "attach" => match self.connect(request) {
+            "launch" | "attach" => match self.connect(request, command == "launch") {
                 Ok(()) => vec![
                     response(request, self.next_sequence(), json!({})),
                     event(self.next_sequence(), "initialized", json!({})),
@@ -117,7 +209,7 @@ impl Adapter {
         }
     }
 
-    fn connect(&mut self, request: &Value) -> Result<()> {
+    fn connect(&mut self, request: &Value, launch: bool) -> Result<()> {
         if self.debug_session.is_some() {
             anyhow::bail!("a 1C debug server is already attached");
         }
@@ -150,6 +242,17 @@ impl Adapter {
         if let Some(types) = &arguments.auto_attach_types {
             server.set_auto_attach_types(&session, types)?;
         }
+        let debuggee = if launch {
+            match launch_debuggee(&arguments, &server) {
+                Ok(debuggee) => Some(debuggee),
+                Err(error) => {
+                    let _ = server.detach_debug_ui(&session);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
         eprintln!(
             "attached Debug UI {} to 1C debug server: {}",
             session.id(),
@@ -157,6 +260,7 @@ impl Adapter {
         );
         self.debug_server = Some(server);
         self.debug_session = Some(session);
+        self.debuggee = debuggee;
         self.poll_failed = false;
         self.module_registry = module_registry;
         self.module_breakpoints.clear();
@@ -169,6 +273,10 @@ impl Adapter {
         }
         self.debug_session = None;
         self.debug_server = None;
+        if let Some(mut debuggee) = self.debuggee.take() {
+            let _ = debuggee.kill();
+            let _ = debuggee.wait();
+        }
         self.poll_failed = false;
         self.threads.clear();
         self.call_stacks.clear();
@@ -390,6 +498,16 @@ impl Adapter {
     }
 
     fn poll(&mut self) -> Vec<Value> {
+        if let Some(debuggee) = &mut self.debuggee {
+            if let Some(status) = debuggee.try_wait().unwrap_or(None) {
+                self.debuggee = None;
+                return vec![event(
+                    self.next_sequence(),
+                    "terminated",
+                    json!({ "restart": false, "exitCode": status.code() }),
+                )];
+            }
+        }
         let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
             return Vec::new();
         };
@@ -879,5 +997,30 @@ mod tests {
             response[0]["body"]["scopes"][0]["variablesReference"],
             7_000_001
         );
+    }
+
+    #[test]
+    fn finds_latest_or_requested_1c_platform_version() {
+        let root = std::env::temp_dir().join(format!("onec-platform-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("8.3.9.1")).unwrap();
+        fs::create_dir_all(root.join("8.3.10.1")).unwrap();
+
+        assert_eq!(
+            platform_bin(&root, None).unwrap(),
+            root.join(if cfg!(windows) {
+                "8.3.10.1/bin"
+            } else {
+                "8.3.10.1"
+            })
+        );
+        assert_eq!(
+            platform_bin(&root, Some("8.3.9.1")).unwrap(),
+            root.join(if cfg!(windows) {
+                "8.3.9.1/bin"
+            } else {
+                "8.3.9.1"
+            })
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

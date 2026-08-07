@@ -6,14 +6,15 @@
 
 ## Статус
 
-Первая итерация готова:
+Реализована рабочая нативная основа отладки через RDBG:
 
-- строгое чтение и запись DAP-сообщений по `stdin`/`stdout`;
-- `initialize`, `launch`/`attach`, `configurationDone`, `threads`, `disconnect` и `terminate`;
-- проверка доступности HTTP-сервера 1С и регистрация/отключение Debug UI;
-- CI с форматированием, Clippy и тестами.
+- DAP `launch`, `attach`, breakpoints, exception breakpoints, stepping, pause, threads и disconnect;
+- source/condition/hit-count/logpoint для BSL-модулей основной конфигурации и расширений;
+- событие остановки, stack trace, локальные variables и evaluate/hover;
+- `launch` выбирает `1cv8c` из `platformPath` (указанная версия или `LATEST`) и запускает его с HTTP-отладкой;
+- CI проверяет форматирование, Clippy, unit-тесты и упаковку VSIX.
 
-Текущая итерация реализует основу XML-сессии RDBG. Следующая часть: начальные настройки, список предметов отладки и точки останова. До её завершения адаптер корректно сообщает, что остальные команды пока не реализованы.
+`attach` предназначен для уже доступного сервера отладки 1С. Для `launch` платформа 1С должна быть установлена у пользователя, но Rust, .NET, Node.js и права администратора для адаптера не нужны.
 
 ## Локальная сборка
 
@@ -29,9 +30,9 @@ cargo build --release
 
 ## Совместимость с VS Code
 
-Готовящееся расширение будет регистрировать тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому существующие `launch.json` сохранят `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; менять нужно будет только установленное расширение. Вместо `dotnet` оно запустит подходящий для ОС нативный бинарник из VSIX.
+Расширение регистрирует тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому конфигурации сохраняют `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; меняется только установленное расширение. Вместо `dotnet` оно запускает подходящий для ОС нативный бинарник из VSIX.
 
-`attach` работает с сервером отладки на другой машине. Для режима `launch` в будущих версиях локально должна быть установлена платформа 1С соответствующей ОС.
+Не устанавливайте оба расширения одновременно: оба владеют типом `onec`. Для разработки до первого release VSIX задайте путь к локальному бинарнику через настройку `onec.nativeAdapterPath`.
 
 Для подключения укажите `infoBaseAlias` — серверный псевдоним информационной базы. Если он совпадает с `infoBase`, достаточно `infoBase`; иначе `infoBaseAlias` имеет приоритет.
 
