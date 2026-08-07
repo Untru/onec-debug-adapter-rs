@@ -109,7 +109,13 @@ struct ConnectionArguments {
 struct InfoBaseTarget {
     alias: String,
     is_file: bool,
+    /// A direct file-base path supplied in `infoBase`. Unlike a launcher
+    /// entry, this must be passed to the client with `/F` and never requires
+    /// registering the base in `ibases.v8i`.
+    direct_file_path: Option<PathBuf>,
 }
+
+const FILE_INFOBASE_ALIAS: &str = "DefAlias";
 
 struct SpawnedDebugServer {
     server: DebugServer,
@@ -124,15 +130,15 @@ fn default_debug_server_port() -> u16 {
     1550
 }
 
-fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Result<Child> {
+fn launch_debuggee(
+    arguments: &ConnectionArguments,
+    info_base_target: &InfoBaseTarget,
+    server: &DebugServer,
+) -> Result<Child> {
     let platform_path = arguments
         .platform_path
         .as_deref()
         .context("launch requires platformPath")?;
-    let info_base = arguments
-        .info_base
-        .as_deref()
-        .context("launch requires infoBase")?;
     let platform_bin = platform_bin(
         &PathBuf::from(platform_path),
         arguments.platform_version.as_deref(),
@@ -148,10 +154,20 @@ fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Res
         .endpoint()
         .strip_suffix("/e1crdbg")
         .unwrap_or(server.endpoint());
-    Command::new(&executable)
-        .args([
+    let mut command = Command::new(&executable);
+    if let Some(path) = &info_base_target.direct_file_path {
+        command.arg("/F").arg(path);
+    } else {
+        command.args([
             "/IBName",
-            info_base,
+            arguments
+                .info_base
+                .as_deref()
+                .context("launch requires infoBase")?,
+        ]);
+    }
+    command
+        .args([
             "/TCOMP",
             "-SDC",
             "/DisableStartupMessages",
@@ -343,21 +359,34 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
         .as_deref()
         .or(arguments.info_base_alias.as_deref())
         .context("launch/attach requires infoBase or infoBaseAlias")?;
-    let launcher_target = ibases_paths().into_iter().find_map(|path| {
-        fs::read_to_string(path)
-            .ok()
-            .and_then(|contents| launcher_info_base(&contents, info_base))
-    });
-    let alias = arguments
-        .info_base_alias
-        .as_deref()
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
-        .or_else(|| launcher_target.as_ref().map(|target| target.alias.clone()))
-        .unwrap_or_else(|| info_base.to_owned());
+    let direct_file_path = direct_file_infobase_path(info_base);
+    let launcher_target = direct_file_path
+        .is_none()
+        .then(|| {
+            ibases_paths().into_iter().find_map(|path| {
+                fs::read_to_string(path)
+                    .ok()
+                    .and_then(|contents| launcher_info_base(&contents, info_base))
+            })
+        })
+        .flatten();
+    let is_file =
+        direct_file_path.is_some() || launcher_target.is_some_and(|target| target.is_file);
+    let alias = if is_file {
+        FILE_INFOBASE_ALIAS.to_owned()
+    } else {
+        arguments
+            .info_base_alias
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .or_else(|| launcher_target.as_ref().map(|target| target.alias.clone()))
+            .unwrap_or_else(|| info_base.to_owned())
+    };
     Ok(InfoBaseTarget {
         alias,
-        is_file: launcher_target.is_some_and(|target| target.is_file),
+        is_file,
+        direct_file_path,
     })
 }
 
@@ -419,16 +448,28 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
             .starts_with("file=")
         {
             return Some(InfoBaseTarget {
-                alias: "DefAlias".to_owned(),
+                alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
+                direct_file_path: None,
             });
         }
         return extract_connection_property(connect, "Ref").map(|alias| InfoBaseTarget {
             alias,
             is_file: false,
+            direct_file_path: None,
         });
     }
     None
+}
+
+fn direct_file_infobase_path(info_base: &str) -> Option<PathBuf> {
+    let path = extract_connection_property(info_base, "File")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let path = PathBuf::from(info_base.trim());
+            path.is_dir().then_some(path)
+        })?;
+    path.is_dir().then_some(path)
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -587,7 +628,7 @@ impl Adapter {
             return Err(error);
         }
         let debuggee = if launch {
-            match launch_debuggee(&arguments, &server) {
+            match launch_debuggee(&arguments, &info_base, &server) {
                 Ok(debuggee) => Some(debuggee),
                 Err(error) => {
                     let _ = server.detach_debug_ui(&session);
@@ -1968,6 +2009,7 @@ Connect=File="/tmp/demo";
             Some(InfoBaseTarget {
                 alias: "DefAlias".to_owned(),
                 is_file: true,
+                direct_file_path: None,
             })
         );
         assert_eq!(
@@ -1975,9 +2017,44 @@ Connect=File="/tmp/demo";
             Some(InfoBaseTarget {
                 alias: "Accounting".to_owned(),
                 is_file: false,
+                direct_file_path: None,
             })
         );
         assert_eq!(launcher_info_base(ibases, "Missing"), None);
+    }
+
+    #[test]
+    fn recognizes_direct_file_infobases_without_a_launcher_registration() {
+        let directory =
+            std::env::temp_dir().join(format!("onec-file-base-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&directory).unwrap();
+        let direct = directory.to_string_lossy().into_owned();
+        let connection = format!("File=\"{direct}\";");
+
+        assert_eq!(direct_file_infobase_path(&direct), Some(directory.clone()));
+        assert_eq!(direct_file_infobase_path(&connection), Some(directory.clone()));
+
+        let arguments = ConnectionArguments {
+            debug_server_host: "localhost".to_owned(),
+            debug_server_port: 1550,
+            info_base: Some(direct),
+            info_base_alias: Some("IgnoredForFileBase".to_owned()),
+            root_project: None,
+            platform_path: None,
+            platform_version: None,
+            extensions: None,
+            auto_attach_types: None,
+        };
+        assert_eq!(
+            info_base_target(&arguments).unwrap(),
+            InfoBaseTarget {
+                alias: FILE_INFOBASE_ALIAS.to_owned(),
+                is_file: true,
+                direct_file_path: Some(directory.clone()),
+            }
+        );
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
