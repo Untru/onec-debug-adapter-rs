@@ -25,6 +25,25 @@ pub struct DebugUiEvent {
     pub target_id: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepAction {
+    Continue,
+    Next,
+    StepIn,
+    StepOut,
+}
+
+impl StepAction {
+    fn rdbg_value(self) -> &'static str {
+        match self {
+            Self::Continue => "Continue",
+            Self::Next => "Step",
+            Self::StepIn => "StepIn",
+            Self::StepOut => "StepOut",
+        }
+    }
+}
+
 impl DebugUiSession {
     pub fn id(&self) -> &str {
         &self.id
@@ -189,6 +208,23 @@ impl DebugServer {
         self.post_xml("attachDetachDbgTargets", &body).map(|_| ())
     }
 
+    /// Continues or steps a single 1C execution context.
+    pub fn step(
+        &self,
+        session: &DebugUiSession,
+        target_id: &str,
+        action: StepAction,
+    ) -> Result<()> {
+        let body = step_request(session, target_id, action);
+        self.post_xml("step", &body).map(|_| ())
+    }
+
+    /// Requests a pause at the next executable statement in the infobase.
+    pub fn break_on_next_statement(&self, session: &DebugUiSession) -> Result<()> {
+        self.post_xml("setBreakOnNextStatement", &base_request(session))
+            .map(|_| ())
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
@@ -257,6 +293,19 @@ fn debug_target_request(session: &DebugUiSession, attach: bool, target_ids: &[St
     base.replacen(
         "</request>",
         &format!("<attach>{attach}</attach>{targets}</request>"),
+        1,
+    )
+}
+
+fn step_request(session: &DebugUiSession, target_id: &str, action: StepAction) -> String {
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!(
+            "<targetID><id>{}</id></targetID><action>{}</action><simple>false</simple></request>",
+            xml_escape(target_id),
+            action.rdbg_value()
+        ),
         1,
     )
 }
@@ -447,6 +496,18 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn serializes_step_requests_with_the_rdbg_action_name() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = step_request(&session, "target-1", StepAction::StepIn);
+
+        assert!(xml.contains("<targetID><id>target-1</id></targetID>"));
+        assert!(xml.contains("<action>StepIn</action>"));
     }
 
     #[test]

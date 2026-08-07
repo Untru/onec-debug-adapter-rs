@@ -3,7 +3,7 @@ mod debug_server;
 
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
-use debug_server::{DebugServer, DebugUiSession};
+use debug_server::{DebugServer, DebugUiSession, StepAction};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -73,6 +73,11 @@ impl Adapter {
                     })).collect::<Vec<_>>(),
                 }),
             )],
+            "continue" => self.step(request, StepAction::Continue),
+            "next" => self.step(request, StepAction::Next),
+            "stepIn" => self.step(request, StepAction::StepIn),
+            "stepOut" => self.step(request, StepAction::StepOut),
+            "pause" => self.pause(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
                 Err(error) => vec![error_response(
@@ -126,6 +131,83 @@ impl Adapter {
         self.poll_failed = false;
         self.threads.clear();
         Ok(())
+    }
+
+    fn step(&mut self, request: &Value, action: StepAction) -> Vec<Value> {
+        let thread_id = match request["arguments"]["threadId"].as_i64() {
+            Some(thread_id) => thread_id,
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "step request requires threadId",
+                )];
+            }
+        };
+        let target_id = match self.target_id(thread_id) {
+            Some(target_id) => target_id.to_owned(),
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    format!("unknown 1C debug thread {thread_id}"),
+                )];
+            }
+        };
+        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+
+        if let Err(error) = server.step(session, &target_id, action) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )];
+        }
+
+        let body = if action == StepAction::Continue {
+            json!({ "allThreadsContinued": false })
+        } else {
+            json!({})
+        };
+        let mut messages = vec![response(request, self.next_sequence(), body)];
+        if action == StepAction::Continue {
+            messages.push(event(
+                self.next_sequence(),
+                "continued",
+                json!({ "threadId": thread_id, "allThreadsContinued": false }),
+            ));
+        }
+        messages
+    }
+
+    fn pause(&mut self, request: &Value) -> Vec<Value> {
+        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        match server.break_on_next_statement(session) {
+            Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
+            Err(error) => vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )],
+        }
+    }
+
+    fn target_id(&self, thread_id: i64) -> Option<&str> {
+        self.threads
+            .iter()
+            .find_map(|(target_id, id)| (*id == thread_id).then_some(target_id.as_str()))
     }
 
     fn poll(&mut self) -> Vec<Value> {
