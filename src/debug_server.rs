@@ -11,6 +11,7 @@ use std::fmt;
 use uuid::Uuid;
 
 const RDBG_REQUEST_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse";
+const AUTO_ATTACH_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugAutoAttach";
 
 /// A successfully registered 1C Debug UI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,7 +467,7 @@ fn auto_attach_settings_request(session: &DebugUiSession, types: &[String]) -> S
         .iter()
         .map(|target_type| {
             format!(
-                "<targetType>{}</targetType>",
+                "<targetType xmlns=\"{AUTO_ATTACH_NAMESPACE}\">{}</targetType>",
                 debug_target_type_xml_value(target_type).expect("validated before serialization")
             )
         })
@@ -1214,6 +1215,20 @@ mod tests {
     }
 
     #[test]
+    fn serializes_auto_attach_target_types_in_the_schema_namespace() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+
+        let xml = auto_attach_settings_request(&session, &["ManagedClient".to_owned()]);
+
+        assert!(xml.contains(&format!(
+            "<targetType xmlns=\"{AUTO_ATTACH_NAMESPACE}\">ManagedClient</targetType>"
+        )));
+    }
+
+    #[test]
     fn serializes_runtime_error_filter() {
         let session = DebugUiSession {
             id: "debug-ui".to_owned(),
@@ -1427,8 +1442,12 @@ mod tests {
         assert!(requests[1].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
         assert!(requests[1].contains("<foregroundAbility>true</foregroundAbility>"));
         assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=setAutoAttachSettings HTTP/1.1"));
-        assert!(requests[2].contains("<targetType>Client</targetType>"));
-        assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
+        assert!(requests[2].contains(&format!(
+            "<targetType xmlns=\"{AUTO_ATTACH_NAMESPACE}\">Client</targetType>"
+        )));
+        assert!(requests[2].contains(&format!(
+            "<targetType xmlns=\"{AUTO_ATTACH_NAMESPACE}\">HTTPService</targetType>"
+        )));
         assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=getDbgTargets HTTP/1.1"));
         assert!(requests[3].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
         assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
