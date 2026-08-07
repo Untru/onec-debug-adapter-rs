@@ -200,13 +200,15 @@ fn launch_file_debug_server(platform_bin: &Path, host: &str) -> Result<SpawnedDe
 
     let deadline = Instant::now() + Duration::from_secs(10);
     let port = loop {
-        match fs::read_to_string(&notify_path) {
-            Ok(notification) => match debug_server_port_from_notification(&notification) {
+        match fs::read(&notify_path) {
+            Ok(notification) => match debug_server_port_from_notification_bytes(&notification) {
                 Ok(port) => break port,
                 Err(error) => {
-                    terminate_child(&mut child);
-                    let _ = fs::remove_file(&notify_path);
-                    return Err(error);
+                    if Instant::now() >= deadline {
+                        terminate_child(&mut child);
+                        let _ = fs::remove_file(&notify_path);
+                        return Err(error);
+                    }
                 }
             },
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -249,6 +251,37 @@ fn debug_server_port_from_notification(notification: &str) -> Result<u16> {
         anyhow::bail!("1C debug server notification contains port 0");
     }
     Ok(port)
+}
+
+/// dbgs writes its notification as UTF-16LE with a BOM on macOS, while Linux
+/// builds commonly use UTF-8. Decode both forms before extracting the
+/// dynamically allocated RDBG port.
+fn debug_server_port_from_notification_bytes(notification: &[u8]) -> Result<u16> {
+    let text = match notification {
+        [0xff, 0xfe, rest @ ..] => decode_utf16_notification(rest, true)?,
+        [0xfe, 0xff, rest @ ..] => decode_utf16_notification(rest, false)?,
+        _ => std::str::from_utf8(notification)
+            .context("1C debug server notification is not valid UTF-8")?
+            .to_owned(),
+    };
+    debug_server_port_from_notification(&text)
+}
+
+fn decode_utf16_notification(notification: &[u8], little_endian: bool) -> Result<String> {
+    let chunks = notification.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        anyhow::bail!("1C debug server notification contains incomplete UTF-16 data");
+    }
+    let words = chunks
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&words).context("1C debug server notification is not valid UTF-16")
 }
 
 fn terminate_child(child: &mut Child) {
@@ -1672,6 +1705,13 @@ Connect=File="/tmp/demo";
         );
         assert!(debug_server_port_from_notification("no-port").is_err());
         assert!(debug_server_port_from_notification("localhost:0").is_err());
+
+        let mut utf16le = vec![0xff, 0xfe];
+        utf16le.extend("127.0.0.1:1558".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(
+            debug_server_port_from_notification_bytes(&utf16le).unwrap(),
+            1558
+        );
     }
 
     #[cfg(unix)]
