@@ -29,6 +29,7 @@ pub struct ModuleInfo {
 #[derive(Debug, Default)]
 pub struct ModuleRegistry {
     by_path: HashMap<PathBuf, ModuleInfo>,
+    by_identity: HashMap<(String, String, String), PathBuf>,
 }
 
 impl ModuleRegistry {
@@ -52,6 +53,21 @@ impl ModuleRegistry {
                 path.display()
             )
         })
+    }
+
+    pub fn path_by_module(
+        &self,
+        extension_name: &str,
+        object_id: &str,
+        property_id: &str,
+    ) -> Option<&Path> {
+        self.by_identity
+            .get(&(
+                extension_name.to_owned(),
+                object_id.to_owned(),
+                property_id.to_owned(),
+            ))
+            .map(PathBuf::as_path)
     }
 
     fn scan_root(&mut self, root: &Path, extension_name: &str) -> Result<()> {
@@ -148,14 +164,20 @@ impl ModuleRegistry {
         let canonical_path = path
             .canonicalize()
             .with_context(|| format!("cannot resolve module path {}", path.display()))?;
-        self.by_path.insert(
-            canonical_path,
-            ModuleInfo {
-                extension_name: extension_name.to_owned(),
-                object_id: object_id.to_owned(),
-                property_id: property_id.to_owned(),
-            },
+        let info = ModuleInfo {
+            extension_name: extension_name.to_owned(),
+            object_id: object_id.to_owned(),
+            property_id: property_id.to_owned(),
+        };
+        self.by_identity.insert(
+            (
+                info.extension_name.clone(),
+                info.object_id.clone(),
+                info.property_id.clone(),
+            ),
+            canonical_path.clone(),
         );
+        self.by_path.insert(canonical_path, info);
         Ok(())
     }
 }
@@ -301,6 +323,14 @@ mod tests {
             .unwrap();
         assert_eq!(common_module.object_id, "tools-uuid");
         assert_eq!(common_module.property_id, COMMON_MODULE_PROPERTY_ID);
+        assert_eq!(
+            registry
+                .path_by_module("", "tools-uuid", COMMON_MODULE_PROPERTY_ID)
+                .unwrap(),
+            root.join("CommonModules/Tools/Ext/Module.bsl")
+                .canonicalize()
+                .unwrap()
+        );
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -4,6 +4,7 @@
 //! means DAP handling can be tested without a running 1C installation.
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::fmt;
@@ -19,10 +20,42 @@ pub struct DebugUiSession {
 }
 
 /// A command delivered asynchronously by the 1C debug server to a Debug UI.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DebugUiEvent {
     pub command_id: String,
     pub target_id: Option<String>,
+    pub call_stack: Vec<DebugStackFrame>,
+    pub stopped_by_breakpoint: bool,
+    pub suspended_by_other: bool,
+    pub send_message_only: bool,
+    pub send_hit_counter_only: bool,
+    pub message: Option<String>,
+}
+
+/// One call-stack item sent by RDBG as part of a `callStackFormed` event.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DebugStackFrame {
+    pub extension_name: String,
+    pub object_id: String,
+    pub property_id: String,
+    pub line: i64,
+    pub presentation: String,
+}
+
+/// A scalar result returned by RDBG expression evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugEvaluation {
+    pub value: String,
+    pub type_name: String,
+    pub error: Option<String>,
+}
+
+/// A readable property in the local context of a stopped 1C stack frame.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DebugVariable {
+    pub name: String,
+    pub type_name: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +304,36 @@ impl DebugServer {
         .map(|_| ())
     }
 
+    /// Evaluates an expression synchronously in a stopped target stack frame.
+    /// RDBG can choose to answer later through `exprEvaluated`; callers receive
+    /// an explicit error in that rare case rather than a fabricated value.
+    pub fn evaluate_expression(
+        &self,
+        session: &DebugUiSession,
+        target_id: &str,
+        stack_level: i64,
+        expression: &str,
+    ) -> Result<DebugEvaluation> {
+        if expression.trim().is_empty() {
+            bail!("expression must not be empty");
+        }
+        let body = evaluation_request(session, target_id, stack_level, expression);
+        let response = self.post_xml("evalExpr", &body)?;
+        parse_evaluation_response(&response)
+    }
+
+    /// Retrieves readable local variables for a stopped target stack frame.
+    pub fn evaluate_local_variables(
+        &self,
+        session: &DebugUiSession,
+        target_id: &str,
+        stack_level: i64,
+    ) -> Result<Vec<DebugVariable>> {
+        let body = local_variables_request(session, target_id, stack_level);
+        let response = self.post_xml("evalLocalVariables", &body)?;
+        parse_local_variables_response(&response)
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
@@ -424,6 +487,149 @@ fn runtime_error_processing_request(
     )
 }
 
+fn evaluation_request(
+    session: &DebugUiSession,
+    target_id: &str,
+    stack_level: i64,
+    expression: &str,
+) -> String {
+    let result_id = Uuid::new_v4();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!(
+            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID><calcItem><itemType>expression</itemType><expression>{}</expression><property></property></calcItem><interfaces>context</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
+            xml_escape(target_id),
+            stack_level.max(0),
+            xml_escape(expression),
+        ),
+        1,
+    )
+}
+
+fn local_variables_request(session: &DebugUiSession, target_id: &str, stack_level: i64) -> String {
+    let result_id = Uuid::new_v4();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!(
+            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID><interfaces>context</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
+            xml_escape(target_id),
+            stack_level.max(0),
+        ),
+        1,
+    )
+}
+
+fn parse_evaluation_response(xml: &str) -> Result<DebugEvaluation> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut names = Vec::<String>::new();
+    let mut error_occurred = false;
+    let mut value = None;
+    let mut type_name = None;
+    let mut error = None;
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                names.push(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
+            }
+            Event::End(_) => {
+                names.pop();
+            }
+            Event::Text(text) => {
+                let Some(name) = names.last().map(String::as_str) else {
+                    continue;
+                };
+                let text = text
+                    .unescape()
+                    .map(|text| text.into_owned())
+                    .context("cannot decode expression evaluation response")?;
+                match name {
+                    "errorOccurred" => error_occurred = xml_bool(&text),
+                    "typeName" => type_name = Some(text),
+                    "pres" => value = Some(decode_base64_text(&text)),
+                    "exceptionStr" => error = Some(decode_base64_text(&text)),
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+
+    if value.is_none() && error.is_none() && !error_occurred {
+        bail!(
+            "1C debug server deferred expression evaluation; asynchronous result is not available"
+        )
+    }
+    Ok(DebugEvaluation {
+        value: value.unwrap_or_default(),
+        type_name: type_name.unwrap_or_default(),
+        error: error_occurred
+            .then_some(error.unwrap_or_else(|| "expression evaluation failed".to_owned())),
+    })
+}
+
+fn parse_local_variables_response(xml: &str) -> Result<Vec<DebugVariable>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut names = Vec::<String>::new();
+    let mut current = None;
+    let mut variables = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "valueOfContextPropInfo" {
+                    current = Some(DebugVariable::default());
+                }
+                names.push(name);
+            }
+            Event::End(element) => {
+                if element.local_name().as_ref() == b"valueOfContextPropInfo" {
+                    if let Some(variable) = current.take() {
+                        if !variable.name.is_empty() {
+                            variables.push(variable);
+                        }
+                    }
+                }
+                names.pop();
+            }
+            Event::Text(text) => {
+                let Some(variable) = &mut current else {
+                    continue;
+                };
+                let Some(name) = names.last().map(String::as_str) else {
+                    continue;
+                };
+                let text = text
+                    .unescape()
+                    .map(|text| text.into_owned())
+                    .context("cannot decode local variables response")?;
+                match name {
+                    "propName" => variable.name = text,
+                    "typeName" => variable.type_name = text,
+                    "pres" | "errorStr" => variable.value = decode_base64_text(&text),
+                    _ => {}
+                }
+            }
+            Event::Eof => return Ok(variables),
+            _ => {}
+        }
+    }
+}
+
+fn decode_base64_text(value: &str) -> String {
+    BASE64
+        .decode(value.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_else(|| value.to_owned())
+}
+
 fn debug_target_type_xml_value(target_type: &str) -> Result<&'static str> {
     match target_type {
         "Client" => Ok("Client"),
@@ -470,60 +676,99 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut depth = 0usize;
-    let mut event_depth = None;
-    let mut target_depth = None;
+    let mut names = Vec::<String>::new();
     let mut current_event = None;
+    let mut current_stack_frame = None;
     let mut events = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
                 depth += 1;
-                let name = element.local_name();
-                if name.as_ref() == b"result" && depth == 2 {
-                    event_depth = Some(depth);
-                    current_event = Some(DebugUiEvent {
-                        command_id: String::new(),
-                        target_id: None,
-                    });
-                } else if current_event.is_some() && name.as_ref() == b"targetID" {
-                    target_depth = Some(depth);
-                } else if let Some(event) = &mut current_event {
-                    if name.as_ref() == b"cmdID" {
-                        event.command_id = reader
-                            .read_text(element.name())
-                            .map(|text| text.into_owned())
-                            .context("cannot read Debug UI command id")?;
-                        depth -= 1;
-                    } else if name.as_ref() == b"id" && target_depth.is_some() {
-                        event.target_id = Some(
-                            reader
-                                .read_text(element.name())
-                                .map(|text| text.into_owned())
-                                .context("cannot read Debug UI target id")?,
-                        );
-                        depth -= 1;
-                    }
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "result" && depth == 2 {
+                    current_event = Some(DebugUiEvent::default());
+                } else if current_event.is_some() && name == "callStack" {
+                    current_stack_frame = Some(DebugStackFrame::default());
                 }
+                names.push(name);
             }
             Event::End(element) => {
-                if element.local_name().as_ref() == b"targetID" {
-                    target_depth = None;
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "callStack" {
+                    if let (Some(event), Some(frame)) =
+                        (&mut current_event, current_stack_frame.take())
+                    {
+                        event.call_stack.push(frame);
+                    }
                 }
-                if event_depth == Some(depth) && element.local_name().as_ref() == b"result" {
+                if name == "result" && depth == 2 {
                     if let Some(event) = current_event.take() {
                         if !event.command_id.is_empty() {
                             events.push(event);
                         }
                     }
-                    event_depth = None;
                 }
+                names.pop();
                 depth = depth.saturating_sub(1);
+            }
+            Event::Text(text) => {
+                let Some(event) = &mut current_event else {
+                    continue;
+                };
+                let value = text
+                    .unescape()
+                    .map(|value| value.into_owned())
+                    .context("cannot decode Debug UI event value")?;
+                let Some(name) = names.last().map(String::as_str) else {
+                    continue;
+                };
+                match name {
+                    "cmdID" => event.command_id = value,
+                    "id" if names.iter().any(|name| name == "targetID") => {
+                        event.target_id = Some(value)
+                    }
+                    "stopByBP" => event.stopped_by_breakpoint = xml_bool(&value),
+                    "suspendedByOther" => event.suspended_by_other = xml_bool(&value),
+                    "sendMessageOnly" => event.send_message_only = xml_bool(&value),
+                    "sendHitCounterOnly" => event.send_hit_counter_only = xml_bool(&value),
+                    "message" => event.message = Some(value),
+                    "extensionName" => set_stack_field(&mut current_stack_frame, |frame| {
+                        frame.extension_name = value
+                    }),
+                    "objectID" => {
+                        set_stack_field(&mut current_stack_frame, |frame| frame.object_id = value)
+                    }
+                    "propertyID" => {
+                        set_stack_field(&mut current_stack_frame, |frame| frame.property_id = value)
+                    }
+                    "lineNo" => set_stack_field(&mut current_stack_frame, |frame| {
+                        frame.line = value.parse().unwrap_or_default()
+                    }),
+                    "presentation" => set_stack_field(&mut current_stack_frame, |frame| {
+                        frame.presentation = BASE64
+                            .decode(value.as_bytes())
+                            .ok()
+                            .and_then(|bytes| String::from_utf8(bytes).ok())
+                            .unwrap_or(value)
+                    }),
+                    _ => {}
+                }
             }
             Event::Eof => return Ok(events),
             _ => {}
         }
     }
+}
+
+fn set_stack_field(frame: &mut Option<DebugStackFrame>, set: impl FnOnce(&mut DebugStackFrame)) {
+    if let Some(frame) = frame {
+        set(frame);
+    }
+}
+
+fn xml_bool(value: &str) -> bool {
+    value == "true" || value == "1"
 }
 
 fn xml_escape(value: &str) -> String {
@@ -603,13 +848,28 @@ mod tests {
                 DebugUiEvent {
                     command_id: "targetStarted".to_owned(),
                     target_id: Some("target-1".to_owned()),
+                    ..DebugUiEvent::default()
                 },
                 DebugUiEvent {
                     command_id: "targetQuit".to_owned(),
                     target_id: Some("target-1".to_owned()),
+                    ..DebugUiEvent::default()
                 },
             ]
         );
+    }
+
+    #[test]
+    fn parses_call_stack_events() {
+        let events = parse_debug_ui_events(
+            "<response><result><cmdID>callStackFormed</cmdID><targetID><id>target-1</id></targetID><stopByBP>true</stopByBP><callStack><moduleID><extensionName></extensionName><objectID>object-id</objectID><propertyID>property-id</propertyID></moduleID><lineNo>42</lineNo><presentation>VGVzdE1ldGhvZA==</presentation></callStack></result></response>",
+        )
+        .unwrap();
+
+        assert_eq!(events[0].target_id.as_deref(), Some("target-1"));
+        assert!(events[0].stopped_by_breakpoint);
+        assert_eq!(events[0].call_stack[0].line, 42);
+        assert_eq!(events[0].call_stack[0].presentation, "TestMethod");
     }
 
     #[test]
@@ -665,6 +925,50 @@ mod tests {
         assert!(xml.contains("<stopOnErrors>true</stopOnErrors>"));
         assert!(xml.contains("<analyzeErrorStr>true</analyzeErrorStr>"));
         assert!(xml.contains("<str>division by zero</str>"));
+    }
+
+    #[test]
+    fn serializes_and_parses_expression_evaluation() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = evaluation_request(&session, "target-1", 2, "A < 3");
+        assert!(xml.contains("<calcWaitingTime>100</calcWaitingTime>"));
+        assert!(xml.contains("<stackLevel>2</stackLevel>"));
+        assert!(xml.contains("<expression>A &lt; 3</expression>"));
+
+        let result = parse_evaluation_response(
+            "<response><result><errorOccurred>false</errorOccurred><resultValueInfo><typeName>Boolean</typeName><pres>0JjRgdGC0LjQvdCw</pres></resultValueInfo></result></response>",
+        )
+        .unwrap();
+        assert_eq!(result.type_name, "Boolean");
+        assert_eq!(result.value, "Истина");
+        assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn serializes_and_parses_local_variables() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = local_variables_request(&session, "target-1", 0);
+        assert!(xml.contains("<stackLevel>0</stackLevel>"));
+        assert!(xml.contains("<interfaces>context</interfaces>"));
+
+        let variables = parse_local_variables_response(
+            "<response><result><calculationResult><valueOfContextPropInfo><propInfo><propName>Counter</propName></propInfo><valueInfo><typeName>Number</typeName><pres>NDI=</pres></valueInfo></valueOfContextPropInfo></calculationResult></result></response>",
+        )
+        .unwrap();
+        assert_eq!(
+            variables,
+            vec![DebugVariable {
+                name: "Counter".to_owned(),
+                type_name: "Number".to_owned(),
+                value: "42".to_owned(),
+            }]
+        );
     }
 
     #[test]
@@ -729,6 +1033,7 @@ mod tests {
             vec![DebugUiEvent {
                 command_id: "targetStarted".to_owned(),
                 target_id: Some("target-1".to_owned()),
+                ..DebugUiEvent::default()
             }]
         );
         server

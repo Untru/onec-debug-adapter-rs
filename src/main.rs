@@ -4,7 +4,10 @@ mod metadata;
 
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
-use debug_server::{DebugServer, DebugUiSession, ModuleBreakpoints, SourceBreakpoint, StepAction};
+use debug_server::{
+    DebugServer, DebugStackFrame, DebugUiEvent, DebugUiSession, ModuleBreakpoints,
+    SourceBreakpoint, StepAction,
+};
 use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -22,6 +25,7 @@ struct Adapter {
     debug_session: Option<DebugUiSession>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
+    call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
 }
@@ -86,6 +90,9 @@ impl Adapter {
                     })).collect::<Vec<_>>(),
                 }),
             )],
+            "stackTrace" => self.stack_trace(request),
+            "scopes" => self.scopes(request),
+            "variables" => self.variables(request),
             "continue" => self.step(request, StepAction::Continue),
             "next" => self.step(request, StepAction::Next),
             "stepIn" => self.step(request, StepAction::StepIn),
@@ -93,6 +100,7 @@ impl Adapter {
             "pause" => self.pause(request),
             "setBreakpoints" => self.set_breakpoints(request),
             "setExceptionBreakpoints" => self.set_exception_breakpoints(request),
+            "evaluate" => self.evaluate(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
                 Err(error) => vec![error_response(
@@ -163,6 +171,7 @@ impl Adapter {
         self.debug_server = None;
         self.poll_failed = false;
         self.threads.clear();
+        self.call_stacks.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
         Ok(())
@@ -392,14 +401,7 @@ impl Adapter {
                 self.poll_failed = false;
                 events
                     .into_iter()
-                    .flat_map(|debug_event| {
-                        self.handle_debug_event(
-                            &server,
-                            &session,
-                            debug_event.command_id,
-                            debug_event.target_id,
-                        )
-                    })
+                    .flat_map(|debug_event| self.handle_debug_event(&server, &session, debug_event))
                     .collect()
             }
             Err(error) if !self.poll_failed => {
@@ -421,10 +423,12 @@ impl Adapter {
         &mut self,
         server: &DebugServer,
         session: &DebugUiSession,
-        command_id: String,
-        target_id: Option<String>,
+        debug_event: DebugUiEvent,
     ) -> Vec<Value> {
-        match (command_id.as_str(), target_id) {
+        match (
+            debug_event.command_id.as_str(),
+            debug_event.target_id.clone(),
+        ) {
             ("targetStarted", Some(target_id)) => {
                 if self.threads.contains_key(&target_id) {
                     return Vec::new();
@@ -445,17 +449,295 @@ impl Adapter {
                 )]
             }
             ("targetQuit", Some(target_id)) => match self.threads.remove(&target_id) {
-                Some(thread_id) => vec![event(
-                    self.next_sequence(),
-                    "thread",
-                    json!({ "reason": "exited", "threadId": thread_id }),
-                )],
+                Some(thread_id) => {
+                    self.call_stacks.remove(&thread_id);
+                    vec![event(
+                        self.next_sequence(),
+                        "thread",
+                        json!({ "reason": "exited", "threadId": thread_id }),
+                    )]
+                }
                 None => Vec::new(),
             },
+            ("callStackFormed", Some(target_id)) => {
+                self.handle_call_stack_event(server, session, target_id, debug_event, None)
+            }
+            ("rteProcessing" | "rteOnBPConditionProcessing", Some(target_id)) => self
+                .handle_call_stack_event(
+                    server,
+                    session,
+                    target_id,
+                    debug_event,
+                    Some("exception"),
+                ),
             (command_id, _) => {
                 vec![self.output_event("console", format!("1C debug event: {command_id}\\n"))]
             }
         }
+    }
+
+    fn handle_call_stack_event(
+        &mut self,
+        server: &DebugServer,
+        session: &DebugUiSession,
+        target_id: String,
+        debug_event: DebugUiEvent,
+        stopped_reason: Option<&str>,
+    ) -> Vec<Value> {
+        let Some(thread_id) = self.threads.get(&target_id).copied() else {
+            return vec![self.output_event(
+                "stderr",
+                format!("received call stack for unattached 1C target {target_id}\\n"),
+            )];
+        };
+        let mut messages = Vec::new();
+        if let Some(message) = debug_event.message.filter(|message| !message.is_empty()) {
+            messages.push(self.output_event("console", format!("{message}\\n")));
+        }
+        if debug_event.send_message_only {
+            if let Err(error) = server.step(session, &target_id, StepAction::Continue) {
+                messages.push(self.output_event(
+                    "stderr",
+                    format!("cannot continue 1C target after message: {error}\\n"),
+                ));
+            }
+            return messages;
+        }
+        if debug_event.send_hit_counter_only {
+            return messages;
+        }
+
+        let mut stack = debug_event.call_stack;
+        stack.reverse();
+        self.call_stacks.insert(thread_id, stack);
+        let reason = stopped_reason.unwrap_or(
+            if debug_event.stopped_by_breakpoint || debug_event.suspended_by_other {
+                "breakpoint"
+            } else {
+                "step"
+            },
+        );
+        messages.push(event(
+            self.next_sequence(),
+            "stopped",
+            json!({ "reason": reason, "threadId": thread_id, "allThreadsStopped": false }),
+        ));
+        messages
+    }
+
+    fn stack_trace(&mut self, request: &Value) -> Vec<Value> {
+        let thread_id = match request["arguments"]["threadId"].as_i64() {
+            Some(thread_id) => thread_id,
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "stackTrace requires threadId",
+                )];
+            }
+        };
+        let Some(stack) = self.call_stacks.get(&thread_id) else {
+            return vec![response(
+                request,
+                self.next_sequence(),
+                json!({ "stackFrames": [], "totalFrames": 0 }),
+            )];
+        };
+        let start_frame = request["arguments"]["startFrame"].as_u64().unwrap_or(0) as usize;
+        let levels = request["arguments"]["levels"]
+            .as_u64()
+            .map(|levels| levels as usize)
+            .unwrap_or(usize::MAX);
+        let total_frames = stack.len();
+        let frames = stack
+            .iter()
+            .enumerate()
+            .skip(start_frame)
+            .take(levels)
+            .map(|(index, frame)| {
+                let name = if frame.presentation.is_empty() {
+                    format!("1C module {}", frame.object_id)
+                } else {
+                    frame.presentation.clone()
+                };
+                let mut value = json!({
+                    "id": thread_id.saturating_mul(1_000_000).saturating_add(index as i64 + 1),
+                    "name": name,
+                    "line": frame.line.max(1),
+                    "column": 1,
+                });
+                if let Some(path) = self.module_registry.as_ref().and_then(|registry| {
+                    registry.path_by_module(
+                        &frame.extension_name,
+                        &frame.object_id,
+                        &frame.property_id,
+                    )
+                }) {
+                    value["source"] = json!({ "path": path.to_string_lossy() });
+                }
+                value
+            })
+            .collect::<Vec<_>>();
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "stackFrames": frames, "totalFrames": total_frames }),
+        )]
+    }
+
+    fn evaluate(&mut self, request: &Value) -> Vec<Value> {
+        let expression = match request["arguments"]["expression"].as_str() {
+            Some(expression) if !expression.trim().is_empty() => expression,
+            _ => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "evaluate requires a non-empty expression",
+                )];
+            }
+        };
+        let (thread_id, stack_level) =
+            match self.frame_address(request["arguments"]["frameId"].as_i64()) {
+                Some(address) => address,
+                None => {
+                    return vec![error_response(
+                        request,
+                        self.next_sequence(),
+                        "evaluate requires a stack frame returned by stackTrace",
+                    )];
+                }
+            };
+        let target_id = match self.target_id(thread_id) {
+            Some(target_id) => target_id.to_owned(),
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    format!("unknown 1C debug thread {thread_id}"),
+                )];
+            }
+        };
+        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let evaluation =
+            match server.evaluate_expression(session, &target_id, stack_level, expression) {
+                Ok(evaluation) => evaluation,
+                Err(error) => {
+                    return vec![error_response(
+                        request,
+                        self.next_sequence(),
+                        error.to_string(),
+                    )];
+                }
+            };
+        let result = evaluation.error.unwrap_or(evaluation.value);
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({
+                "result": result,
+                "type": evaluation.type_name,
+                "variablesReference": 0,
+            }),
+        )]
+    }
+
+    fn scopes(&mut self, request: &Value) -> Vec<Value> {
+        let Some(frame_id) = request["arguments"]["frameId"].as_i64() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "scopes requires frameId",
+            )];
+        };
+        if self.frame_address(Some(frame_id)).is_none() {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "unknown stack frame",
+            )];
+        }
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({
+                "scopes": [{
+                    "name": "Локальные",
+                    "variablesReference": frame_id,
+                    "expensive": false,
+                }],
+            }),
+        )]
+    }
+
+    fn variables(&mut self, request: &Value) -> Vec<Value> {
+        let (thread_id, stack_level) =
+            match self.frame_address(request["arguments"]["variablesReference"].as_i64()) {
+                Some(address) => address,
+                None => {
+                    return vec![error_response(
+                        request,
+                        self.next_sequence(),
+                        "variablesReference does not identify a current stack frame",
+                    )];
+                }
+            };
+        let target_id = match self.target_id(thread_id) {
+            Some(target_id) => target_id.to_owned(),
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    format!("unknown 1C debug thread {thread_id}"),
+                )];
+            }
+        };
+        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let variables = match server.evaluate_local_variables(session, &target_id, stack_level) {
+            Ok(variables) => variables,
+            Err(error) => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({
+                "variables": variables.into_iter().map(|variable| json!({
+                    "name": variable.name,
+                    "type": variable.type_name,
+                    "value": variable.value,
+                    "variablesReference": 0,
+                })).collect::<Vec<_>>(),
+            }),
+        )]
+    }
+
+    fn frame_address(&self, frame_id: Option<i64>) -> Option<(i64, i64)> {
+        let frame_id = frame_id?;
+        if frame_id <= 1_000_000 {
+            return None;
+        }
+        let thread_id = frame_id / 1_000_000;
+        let stack_level = frame_id % 1_000_000 - 1;
+        self.call_stacks.get(&thread_id).and_then(|stack| {
+            ((stack_level as usize) < stack.len()).then_some((thread_id, stack_level))
+        })
     }
 
     fn output_event(&mut self, category: &str, output: String) -> Value {
@@ -544,4 +826,58 @@ fn main() -> Result<()> {
     }
     let _ = stderr();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn returns_rdbg_call_stack_as_dap_stack_frames() {
+        let mut adapter = Adapter::default();
+        adapter.call_stacks.insert(
+            7,
+            vec![DebugStackFrame {
+                extension_name: String::new(),
+                object_id: "module-id".to_owned(),
+                property_id: "property-id".to_owned(),
+                line: 42,
+                presentation: "DoWork".to_owned(),
+            }],
+        );
+        let request = json!({
+            "seq": 9,
+            "type": "request",
+            "command": "stackTrace",
+            "arguments": { "threadId": 7 },
+        });
+
+        let response = adapter.stack_trace(&request);
+
+        assert_eq!(response[0]["body"]["totalFrames"], 1);
+        assert_eq!(response[0]["body"]["stackFrames"][0]["name"], "DoWork");
+        assert_eq!(response[0]["body"]["stackFrames"][0]["line"], 42);
+    }
+
+    #[test]
+    fn exposes_locals_scope_for_a_returned_stack_frame() {
+        let mut adapter = Adapter::default();
+        adapter
+            .call_stacks
+            .insert(7, vec![DebugStackFrame::default()]);
+        let request = json!({
+            "seq": 10,
+            "type": "request",
+            "command": "scopes",
+            "arguments": { "frameId": 7_000_001 },
+        });
+
+        let response = adapter.scopes(&request);
+
+        assert_eq!(response[0]["body"]["scopes"][0]["name"], "Локальные");
+        assert_eq!(
+            response[0]["body"]["scopes"][0]["variablesReference"],
+            7_000_001
+        );
+    }
 }
