@@ -37,9 +37,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Smoke test native DAP adapter
-        run: cargo test --locked
       - run: cargo build --locked --release
+      - name: Smoke test native DAP adapter
+        shell: bash
+        run: |
+          request='{"seq":1,"type":"request","command":"initialize","arguments":{}}'
+          printf 'Content-Length: %s\r\n\r\n%s' "${#request}" "$request" |
+            "target/release/${{ matrix.binary }}" > response.txt
+          grep -q '"command":"initialize"' response.txt
+          grep -q '"supportsConfigurationDoneRequest":true' response.txt
       - name: Bundle native adapter
         shell: bash
         run: |
