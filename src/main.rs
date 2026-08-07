@@ -502,6 +502,7 @@ impl Adapter {
             "pause" => self.pause(request),
             "setBreakpoints" => self.set_breakpoints(request),
             "setExceptionBreakpoints" => self.set_exception_breakpoints(request),
+            "SetAutoAttachTargetTypesRequest" => self.set_auto_attach_target_types(request),
             "evaluate" => self.evaluate(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
@@ -840,6 +841,57 @@ impl Adapter {
             self.next_sequence(),
             json!({ "breakpoints": [{ "verified": true }] }),
         )]
+    }
+
+    fn set_auto_attach_target_types(&mut self, request: &Value) -> Vec<Value> {
+        let Some(types) = request["arguments"]["types"].as_array() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "SetAutoAttachTargetTypesRequest requires arguments.types",
+            )];
+        };
+        let types = match types
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .context("each auto-attach type must be a string")
+            })
+            .collect::<Result<Vec<_>>>()
+        {
+            Ok(types) => types,
+            Err(error) => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        let Some(server) = &self.debug_server else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let Some(session) = &self.debug_session else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        match server.set_auto_attach_types(session, &types) {
+            Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
+            Err(error) => vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )],
+        }
     }
 
     fn target_id(&self, thread_id: i64) -> Option<&str> {
@@ -1639,6 +1691,38 @@ mod tests {
                 ..
             }) if path == &vec![CalculationPathItem::Expression("Document".to_owned())]
         ));
+    }
+
+    #[test]
+    fn validates_dynamic_auto_attach_requests() {
+        let mut adapter = Adapter::default();
+        let invalid = json!({
+            "seq": 13,
+            "type": "request",
+            "command": "SetAutoAttachTargetTypesRequest",
+            "arguments": { "types": ["Client", 7] },
+        });
+        let invalid_response = adapter.handle(&invalid);
+        assert!(!invalid_response[0]["success"].as_bool().unwrap());
+        assert!(
+            invalid_response[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("must be a string")
+        );
+
+        let no_session = json!({
+            "seq": 14,
+            "type": "request",
+            "command": "SetAutoAttachTargetTypesRequest",
+            "arguments": { "types": [] },
+        });
+        let no_session_response = adapter.handle(&no_session);
+        assert!(!no_session_response[0]["success"].as_bool().unwrap());
+        assert_eq!(
+            no_session_response[0]["message"],
+            "no 1C debug session is attached"
+        );
     }
 
     #[test]

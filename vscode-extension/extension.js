@@ -23,6 +23,18 @@ function adapterPath(extensionPath) {
   return configuredPath || bundledAdapterPath(extensionPath);
 }
 
+function configuredAutoAttachTypes(session) {
+  const configurations = vscode.workspace
+    .getConfiguration("launch")
+    .get("configurations", []);
+  const configuration = configurations.find(
+    (item) => item && item.type === "onec" && item.name === session.configuration.name
+  );
+  return Array.isArray(configuration?.autoAttachTypes)
+    ? configuration.autoAttachTypes
+    : [];
+}
+
 function activate(context) {
   const factory = {
     createDebugAdapterDescriptor() {
@@ -40,8 +52,30 @@ function activate(context) {
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterDescriptorFactory("onec", factory)
   );
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((event) => {
+      const session = vscode.debug.activeDebugSession;
+      if (
+        session?.type === "onec" &&
+        event.affectsConfiguration("launch.configurations")
+      ) {
+        session
+          .customRequest("SetAutoAttachTargetTypesRequest", {
+            types: configuredAutoAttachTypes(session)
+          })
+          .then(undefined, () => undefined);
+      }
+    })
+  );
 }
 
 function deactivate() {}
 
-module.exports = { activate, deactivate, adapterPath, bundledAdapterPath, platformBinaryName };
+module.exports = {
+  activate,
+  deactivate,
+  adapterPath,
+  bundledAdapterPath,
+  configuredAutoAttachTypes,
+  platformBinaryName
+};
