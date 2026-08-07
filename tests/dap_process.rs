@@ -258,7 +258,7 @@ while true; do sleep 1; done
     assert!(
         requests
             .iter()
-            .any(|request| request.contains("cmd=rdbgTest"))
+            .any(|request| request.contains("rdbgTest?cmd=test"))
     );
     assert!(
         requests
