@@ -536,7 +536,7 @@ fn breakpoints_request(session: &DebugUiSession, modules: &[ModuleBreakpoints]) 
                 })
                 .collect::<String>();
             format!(
-                "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id xmlns=\"{DEBUG_BASE_NAMESPACE}\"><type>{module_type}</type><URL></URL><extensionName>{}</extensionName><objectID>{}</objectID><propertyID>{}</propertyID><extId>0</extId><version></version></id>{breakpoints}</moduleBPInfo>",
+                "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id><type xmlns=\"{DEBUG_BASE_NAMESPACE}\">{module_type}</type><URL xmlns=\"{DEBUG_BASE_NAMESPACE}\"></URL><extensionName xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</extensionName><objectID xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</objectID><propertyID xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</propertyID><extId xmlns=\"{DEBUG_BASE_NAMESPACE}\">0</extId></id>{breakpoints}</moduleBPInfo>",
                 xml_escape(&module.extension_name),
                 xml_escape(&module.object_id),
                 xml_escape(&module.property_id),
@@ -1197,8 +1197,9 @@ mod tests {
 
         assert!(xml.contains("<bpWorkspace>"));
         assert!(xml.contains(&format!(
-            "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id xmlns=\"{DEBUG_BASE_NAMESPACE}\"><type>ConfigModule</type>"
+            "<moduleBPInfo xmlns=\"{BREAKPOINTS_NAMESPACE}\"><id><type xmlns=\"{DEBUG_BASE_NAMESPACE}\">ConfigModule</type>"
         )));
+        assert!(!xml.contains("<version>"));
         assert!(xml.contains("<line>42</line>"));
         assert!(xml.contains("<condition>A &lt; 3</condition>"));
         assert!(xml.contains("<hitCount>5</hitCount>"));
