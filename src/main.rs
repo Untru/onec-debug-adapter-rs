@@ -428,6 +428,7 @@ impl Adapter {
                     "supportsLogPoints": true,
                     "supportsEvaluateForHovers": true,
                     "supportsTerminateRequest": true,
+                    "supportsExceptionFilterOptions": true,
                     "exceptionBreakpointFilters": [{
                         "filter": "runtimeErrors",
                         "label": "1C runtime errors",
@@ -849,7 +850,7 @@ impl Adapter {
             if let Some(error) = detach_error {
                 messages.push(self.output_event(
                     "stderr",
-                    format!("cannot detach 1C Debug UI after client exit: {error}\\n"),
+                    format!("cannot detach 1C Debug UI after client exit: {error}\n"),
                 ));
             }
             messages.push(event(self.next_sequence(), "terminated", json!({})));
@@ -876,7 +877,7 @@ impl Adapter {
                     "output",
                     json!({
                         "category": "stderr",
-                        "output": format!("1C debug server poll failed: {error}\\n"),
+                        "output": format!("1C debug server poll failed: {error}\n"),
                     }),
                 )]
             }
@@ -898,11 +899,19 @@ impl Adapter {
                 if self.threads.contains_key(&target_id) {
                     return Vec::new();
                 }
+                if let Err(error) = server.clear_break_on_next_statement(session) {
+                    return vec![
+                        self.output_event(
+                            "stderr",
+                            format!("cannot clear 1C break-on-next-statement: {error}\n"),
+                        ),
+                    ];
+                }
                 if let Err(error) =
                     server.attach_debug_targets(session, std::slice::from_ref(&target_id))
                 {
                     return vec![
-                        self.output_event("stderr", format!("cannot attach 1C target: {error}\\n")),
+                        self.output_event("stderr", format!("cannot attach 1C target: {error}\n")),
                     ];
                 }
                 let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
@@ -938,7 +947,7 @@ impl Adapter {
                 ),
             ("exprEvaluated", _) => self.handle_evaluation_event(debug_event),
             (command_id, _) => {
-                vec![self.output_event("console", format!("1C debug event: {command_id}\\n"))]
+                vec![self.output_event("console", format!("1C debug event: {command_id}\n"))]
             }
         }
     }
@@ -954,18 +963,18 @@ impl Adapter {
         let Some(thread_id) = self.threads.get(&target_id).copied() else {
             return vec![self.output_event(
                 "stderr",
-                format!("received call stack for unattached 1C target {target_id}\\n"),
+                format!("received call stack for unattached 1C target {target_id}\n"),
             )];
         };
         let mut messages = Vec::new();
         if let Some(message) = debug_event.message.filter(|message| !message.is_empty()) {
-            messages.push(self.output_event("console", format!("{message}\\n")));
+            messages.push(self.output_event("console", format!("{message}\n")));
         }
         if debug_event.send_message_only {
             if let Err(error) = server.step(session, &target_id, StepAction::Continue) {
                 messages.push(self.output_event(
                     "stderr",
-                    format!("cannot continue 1C target after message: {error}\\n"),
+                    format!("cannot continue 1C target after message: {error}\n"),
                 ));
             }
             return messages;

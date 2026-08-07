@@ -289,6 +289,15 @@ impl DebugServer {
         self.post_xml("attachDetachDbgTargets", &body).map(|_| ())
     }
 
+    /// Clears a pending global "break on next statement" request before a
+    /// newly announced execution context is attached. Otherwise RDBG can stop
+    /// the context immediately for a pause request that VS Code has already
+    /// completed.
+    pub fn clear_break_on_next_statement(&self, session: &DebugUiSession) -> Result<()> {
+        self.post_xml("clearBreakOnNextStatement", &base_request(session))
+            .map(|_| ())
+    }
+
     /// Continues or steps a single 1C execution context.
     pub fn step(
         &self,
@@ -1238,6 +1247,7 @@ mod tests {
                 "<response></response>",
                 "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result></response>",
                 "<response></response>",
+                "<response></response>",
                 "<response><result>true</result></response>",
             ];
             let mut requests = Vec::new();
@@ -1292,6 +1302,7 @@ mod tests {
                 ..DebugUiEvent::default()
             }]
         );
+        server.clear_break_on_next_statement(&session).unwrap();
         server
             .attach_debug_targets(&session, &["target-1".to_owned()])
             .unwrap();
@@ -1306,10 +1317,15 @@ mod tests {
         assert!(requests[2].contains("<targetType>Client</targetType>"));
         assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
         assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
-        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
-        assert!(requests[4].contains("<attach>true</attach><id><id>target-1</id></id>"));
-        assert!(requests[5].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[5].contains(&format!(
+        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=clearBreakOnNextStatement HTTP/1.1"));
+        assert!(requests[4].contains(&format!(
+            "<idOfDebuggerUI>{}</idOfDebuggerUI>",
+            session.id()
+        )));
+        assert!(requests[5].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
+        assert!(requests[5].contains("<attach>true</attach><id><id>target-1</id></id>"));
+        assert!(requests[6].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[6].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));
