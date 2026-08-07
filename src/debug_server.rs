@@ -300,8 +300,14 @@ mod tests {
 
     #[test]
     fn converts_vscode_auto_attach_types_to_rdbg_values() {
-        assert_eq!(debug_target_type_xml_value("HttpService").unwrap(), "HTTPService");
-        assert_eq!(debug_target_type_xml_value("WebClient").unwrap(), "WEBClient");
+        assert_eq!(
+            debug_target_type_xml_value("HttpService").unwrap(),
+            "HTTPService"
+        );
+        assert_eq!(
+            debug_target_type_xml_value("WebClient").unwrap(),
+            "WEBClient"
+        );
         assert!(debug_target_type_xml_value("Unknown").is_err());
     }
 
