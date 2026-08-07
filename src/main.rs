@@ -7,12 +7,16 @@ use debug_server::{DebugServer, DebugUiSession};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, stderr};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Default)]
 struct Adapter {
     next_sequence: u64,
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
+    poll_failed: bool,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +106,7 @@ impl Adapter {
         );
         self.debug_server = Some(server);
         self.debug_session = Some(session);
+        self.poll_failed = false;
         Ok(())
     }
 
@@ -111,23 +116,86 @@ impl Adapter {
         }
         self.debug_session = None;
         self.debug_server = None;
+        self.poll_failed = false;
         Ok(())
+    }
+
+    fn poll(&mut self) -> Vec<Value> {
+        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+            return Vec::new();
+        };
+
+        match server.ping_debug_ui(session) {
+            Ok(events) => {
+                self.poll_failed = false;
+                events
+                    .into_iter()
+                    .map(|debug_event| {
+                        event(
+                            self.next_sequence(),
+                            "output",
+                            json!({
+                                "category": "console",
+                                "output": format!("1C debug event: {}\\n", debug_event.command_id),
+                            }),
+                        )
+                    })
+                    .collect()
+            }
+            Err(error) if !self.poll_failed => {
+                self.poll_failed = true;
+                vec![event(
+                    self.next_sequence(),
+                    "output",
+                    json!({
+                        "category": "stderr",
+                        "output": format!("1C debug server poll failed: {error}\\n"),
+                    }),
+                )]
+            }
+            Err(_) => Vec::new(),
+        }
     }
 }
 
 fn main() -> Result<()> {
-    let mut reader = Reader::new(io::stdin().lock());
+    let (sender, receiver) = mpsc::channel::<std::result::Result<Value, String>>();
+    thread::spawn(move || {
+        let mut reader = Reader::new(io::stdin().lock());
+        loop {
+            match reader.read() {
+                Ok(Some(message)) if sender.send(Ok(message.0)).is_err() => break,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => {
+                    let _ = sender.send(Err(error.to_string()));
+                    break;
+                }
+            }
+        }
+    });
+
     let mut writer = Writer::new(io::stdout().lock());
     let mut adapter = Adapter::default();
 
-    while let Some(message) = reader.read()? {
-        let request = message.0;
-        if request["type"] != "request" {
-            eprintln!("ignoring non-request DAP message: {request}");
-            continue;
-        }
-        for outgoing in adapter.handle(&request) {
-            writer.write(&outgoing)?;
+    loop {
+        match receiver.recv_timeout(Duration::from_millis(25)) {
+            Ok(Ok(request)) => {
+                if request["type"] != "request" {
+                    eprintln!("ignoring non-request DAP message: {request}");
+                    continue;
+                }
+                for outgoing in adapter.handle(&request) {
+                    writer.write(&outgoing)?;
+                }
+            }
+            Ok(Err(error)) => anyhow::bail!("cannot read DAP input: {error}"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                for outgoing in adapter.poll() {
+                    writer.write(&outgoing)?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = stderr();

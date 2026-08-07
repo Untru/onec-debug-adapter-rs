@@ -18,6 +18,12 @@ pub struct DebugUiSession {
     info_base_alias: String,
 }
 
+/// A command delivered asynchronously by the 1C debug server to a Debug UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DebugUiEvent {
+    pub command_id: String,
+}
+
 impl DebugUiSession {
     pub fn id(&self) -> &str {
         &self.id
@@ -157,12 +163,34 @@ impl DebugServer {
         self.post_xml("setAutoAttachSettings", &body).map(|_| ())
     }
 
+    /// Fetches pending Debug UI commands. The caller is responsible for
+    /// translating these commands to DAP events.
+    pub fn ping_debug_ui(&self, session: &DebugUiSession) -> Result<Vec<DebugUiEvent>> {
+        let url = format!("{}/rdbg?cmd=pingDebugUIParams&dbgui={}", self.endpoint, session.id());
+        let response = self.post_empty(&url, "pingDebugUIParams")?;
+        Ok(response_elements(&response, "cmdID")?
+            .into_iter()
+            .map(|command_id| DebugUiEvent { command_id })
+            .collect())
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
             .header("User-Agent", "1CV8")
             .header("Content-Type", "application/xml; charset=utf-8")
             .send(body)
+            .with_context(|| format!("1C debug server request `{command}` failed"))?;
+        response
+            .body_mut()
+            .read_to_string()
+            .context("cannot read XML response from 1C debug server")
+    }
+
+    fn post_empty(&self, url: &str, command: &str) -> Result<String> {
+        let mut response = ureq::post(url)
+            .header("User-Agent", "1CV8")
+            .send_empty()
             .with_context(|| format!("1C debug server request `{command}` failed"))?;
         response
             .body_mut()
@@ -247,6 +275,29 @@ fn response_element(xml: &str, expected_element: &str) -> Result<String> {
     }
 }
 
+fn response_elements(xml: &str, expected_element: &str) -> Result<Vec<String>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut values = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element)
+                if element.local_name().as_ref() == expected_element.as_bytes() =>
+            {
+                values.push(
+                    reader
+                        .read_text(element.name())
+                        .map(|text| text.into_owned())
+                        .context("cannot read XML response value")?,
+                );
+            }
+            Event::Eof => return Ok(values),
+            _ => {}
+        }
+    }
+}
+
 fn xml_escape(value: &str) -> String {
     value
         .replace('&', "&amp;")
@@ -283,6 +334,14 @@ mod tests {
     fn parses_namespaced_response_result() {
         let xml = "<response xmlns=\"http://v8.1c.ru/8.3/debugger/debugBaseData\"><result>registered</result></response>";
         assert_eq!(response_element(xml, "result").unwrap(), "registered");
+        assert_eq!(
+            response_elements(
+                "<response><result><cmdID>targetStarted</cmdID><cmdID>targetQuit</cmdID></result></response>",
+                "cmdID"
+            )
+            .unwrap(),
+            vec!["targetStarted".to_owned(), "targetQuit".to_owned()]
+        );
     }
 
     #[test]
@@ -320,6 +379,7 @@ mod tests {
                 "",
                 "<response><result>registered</result></response>",
                 "<response></response>",
+                "<response><result><cmdID>targetStarted</cmdID></result></response>",
                 "<response><result>true</result></response>",
             ];
             let mut requests = Vec::new();
@@ -366,6 +426,12 @@ mod tests {
         server
             .set_auto_attach_types(&session, &["Client".to_owned(), "HttpService".to_owned()])
             .unwrap();
+        assert_eq!(
+            server.ping_debug_ui(&session).unwrap(),
+            vec![DebugUiEvent {
+                command_id: "targetStarted".to_owned()
+            }]
+        );
         server.detach_debug_ui(&session).unwrap();
         let requests = server_thread.join().unwrap();
 
@@ -376,8 +442,9 @@ mod tests {
         assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=setAutoAttachSettings HTTP/1.1"));
         assert!(requests[2].contains("<targetType>Client</targetType>"));
         assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
-        assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[3].contains(&format!(
+        assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
+        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[4].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));
