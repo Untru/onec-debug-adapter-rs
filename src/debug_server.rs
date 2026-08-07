@@ -121,12 +121,17 @@ impl DebugServer {
 
         match result {
             AttachDebugUiResult::Registered => Ok(session),
-            AttachDebugUiResult::CredentialsRequired | AttachDebugUiResult::FullCredentialsRequired => {
+            AttachDebugUiResult::CredentialsRequired
+            | AttachDebugUiResult::FullCredentialsRequired => {
                 bail!("1C debug server requires infobase credentials")
             }
             AttachDebugUiResult::IbInDebug => bail!("the infobase is already being debugged"),
-            AttachDebugUiResult::NotRegistered => bail!("the infobase is not registered for debugging"),
-            AttachDebugUiResult::Unknown => bail!("the 1C debug server returned an unknown attach result"),
+            AttachDebugUiResult::NotRegistered => {
+                bail!("the infobase is not registered for debugging")
+            }
+            AttachDebugUiResult::Unknown => {
+                bail!("the 1C debug server returned an unknown attach result")
+            }
         }
     }
 
@@ -177,7 +182,9 @@ fn response_element(xml: &str, expected_element: &str) -> Result<String> {
 
     loop {
         match reader.read_event()? {
-            Event::Start(element) if element.local_name().as_ref() == expected_element.as_bytes() => {
+            Event::Start(element)
+                if element.local_name().as_ref() == expected_element.as_bytes() =>
+            {
                 return reader
                     .read_text(element.name())
                     .map(|text| text.into_owned())
@@ -212,7 +219,9 @@ mod tests {
         let xml = attach_debug_ui_request(&session);
 
         assert!(xml.contains("<infoBaseAlias>Sales &amp; &lt;Retail&gt;</infoBaseAlias>"));
-        assert!(xml.contains("<idOfDebuggerUI>0f45f589-6c7d-4f5f-8433-4e8f611e6a9a</idOfDebuggerUI>"));
+        assert!(
+            xml.contains("<idOfDebuggerUI>0f45f589-6c7d-4f5f-8433-4e8f611e6a9a</idOfDebuggerUI>")
+        );
         assert!(xml.contains("<foregroundAbility>true</foregroundAbility>"));
     }
 
@@ -224,8 +233,14 @@ mod tests {
 
     #[test]
     fn recognizes_all_documented_attach_results() {
-        assert_eq!(AttachDebugUiResult::parse("registered").unwrap(), AttachDebugUiResult::Registered);
-        assert_eq!(AttachDebugUiResult::parse("ibInDebug").unwrap(), AttachDebugUiResult::IbInDebug);
+        assert_eq!(
+            AttachDebugUiResult::parse("registered").unwrap(),
+            AttachDebugUiResult::Registered
+        );
+        assert_eq!(
+            AttachDebugUiResult::parse("ibInDebug").unwrap(),
+            AttachDebugUiResult::IbInDebug
+        );
         assert!(AttachDebugUiResult::parse("unexpected").is_err());
     }
 }
