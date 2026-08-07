@@ -1,13 +1,16 @@
 mod dap;
 mod debug_server;
+mod metadata;
 
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
-use debug_server::{DebugServer, DebugUiSession, StepAction};
+use debug_server::{DebugServer, DebugUiSession, ModuleBreakpoints, SourceBreakpoint, StepAction};
+use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::io::{self, stderr};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -19,6 +22,8 @@ struct Adapter {
     debug_session: Option<DebugUiSession>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
+    module_registry: Option<ModuleRegistry>,
+    module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
 }
 
 #[derive(Deserialize)]
@@ -28,6 +33,8 @@ struct ConnectionArguments {
     debug_server_port: u16,
     info_base: Option<String>,
     info_base_alias: Option<String>,
+    root_project: Option<String>,
+    extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
 }
 
@@ -46,6 +53,7 @@ impl Adapter {
                 json!({
                     "supportsConfigurationDoneRequest": true,
                     "supportsConditionalBreakpoints": true,
+                    "supportsHitConditionalBreakpoints": true,
                     "supportsLogPoints": true,
                     "supportsEvaluateForHovers": true,
                     "supportsTerminateRequest": true,
@@ -78,6 +86,7 @@ impl Adapter {
             "stepIn" => self.step(request, StepAction::StepIn),
             "stepOut" => self.step(request, StepAction::StepOut),
             "pause" => self.pause(request),
+            "setBreakpoints" => self.set_breakpoints(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
                 Err(error) => vec![error_response(
@@ -102,6 +111,22 @@ impl Adapter {
             serde_json::from_value(request["arguments"].clone())
                 .context("launch/attach requires debugServerHost and debugServerPort")?;
         let server = DebugServer::new(&arguments.debug_server_host, arguments.debug_server_port)?;
+        let module_registry = match arguments.root_project.as_deref() {
+            Some(root_project) => {
+                let extensions = arguments
+                    .extensions
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect::<Vec<_>>();
+                Some(ModuleRegistry::load(
+                    &PathBuf::from(root_project),
+                    &extensions,
+                )?)
+            }
+            None => None,
+        };
         let info_base_alias = arguments
             .info_base_alias
             .as_deref()
@@ -119,6 +144,8 @@ impl Adapter {
         self.debug_server = Some(server);
         self.debug_session = Some(session);
         self.poll_failed = false;
+        self.module_registry = module_registry;
+        self.module_breakpoints.clear();
         Ok(())
     }
 
@@ -130,6 +157,8 @@ impl Adapter {
         self.debug_server = None;
         self.poll_failed = false;
         self.threads.clear();
+        self.module_registry = None;
+        self.module_breakpoints.clear();
         Ok(())
     }
 
@@ -202,6 +231,99 @@ impl Adapter {
                 error.to_string(),
             )],
         }
+    }
+
+    fn set_breakpoints(&mut self, request: &Value) -> Vec<Value> {
+        let source_path = match request["arguments"]["source"]["path"].as_str() {
+            Some(path) if !path.is_empty() => path,
+            _ => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "setBreakpoints requires arguments.source.path",
+                )];
+            }
+        };
+        let registry = match &self.module_registry {
+            Some(registry) => registry,
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "setBreakpoints requires rootProject in the launch configuration",
+                )];
+            }
+        };
+        let module = match registry.module_by_path(&PathBuf::from(source_path)) {
+            Ok(module) => module.clone(),
+            Err(error) => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        let breakpoints = match dap_source_breakpoints(request) {
+            Ok(breakpoints) => breakpoints,
+            Err(error) => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        let key = (
+            module.extension_name.clone(),
+            module.object_id.clone(),
+            module.property_id.clone(),
+        );
+        self.module_breakpoints.insert(key, breakpoints.clone());
+        let modules = self
+            .module_breakpoints
+            .iter()
+            .map(
+                |((extension_name, object_id, property_id), breakpoints)| ModuleBreakpoints {
+                    extension_name: extension_name.clone(),
+                    object_id: object_id.clone(),
+                    property_id: property_id.clone(),
+                    breakpoints: breakpoints.clone(),
+                },
+            )
+            .collect::<Vec<_>>();
+        let Some(server) = &self.debug_server else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let Some(session) = &self.debug_session else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        if let Err(error) = server.set_breakpoints(session, &modules) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )];
+        }
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({
+                "breakpoints": breakpoints.into_iter().map(|breakpoint| json!({
+                    "verified": true,
+                    "line": breakpoint.line,
+                    "source": { "path": source_path },
+                })).collect::<Vec<_>>(),
+            }),
+        )]
     }
 
     fn target_id(&self, thread_id: i64) -> Option<&str> {
@@ -295,6 +417,38 @@ impl Adapter {
             json!({ "category": category, "output": output }),
         )
     }
+}
+
+fn dap_source_breakpoints(request: &Value) -> Result<Vec<SourceBreakpoint>> {
+    let breakpoints = request["arguments"]["breakpoints"]
+        .as_array()
+        .context("setBreakpoints requires arguments.breakpoints")?;
+    breakpoints
+        .iter()
+        .map(|breakpoint| {
+            let line = breakpoint["line"]
+                .as_i64()
+                .filter(|line| *line > 0)
+                .context("each source breakpoint requires a positive line number")?;
+            let condition = breakpoint["condition"].as_str().map(str::to_owned);
+            let hit_condition = breakpoint["hitCondition"]
+                .as_str()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value
+                        .parse::<i64>()
+                        .context("hitCondition must be an integer")
+                })
+                .transpose()?;
+            let log_message = breakpoint["logMessage"].as_str().map(str::to_owned);
+            Ok(SourceBreakpoint {
+                line,
+                condition,
+                hit_condition,
+                log_message,
+            })
+        })
+        .collect()
 }
 
 fn main() -> Result<()> {

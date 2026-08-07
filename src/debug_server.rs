@@ -33,6 +33,24 @@ pub enum StepAction {
     StepOut,
 }
 
+/// One source breakpoint in the format understood by the 1C RDBG API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceBreakpoint {
+    pub line: i64,
+    pub condition: Option<String>,
+    pub hit_condition: Option<i64>,
+    pub log_message: Option<String>,
+}
+
+/// The RDBG identity of a configuration module and its requested breakpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBreakpoints {
+    pub extension_name: String,
+    pub object_id: String,
+    pub property_id: String,
+    pub breakpoints: Vec<SourceBreakpoint>,
+}
+
 impl StepAction {
     fn rdbg_value(self) -> &'static str {
         match self {
@@ -225,6 +243,19 @@ impl DebugServer {
             .map(|_| ())
     }
 
+    /// Replaces the complete internal breakpoint workspace for this Debug UI.
+    ///
+    /// RDBG does not offer a per-file mutation. Callers should retain all files'
+    /// breakpoints and submit the complete workspace whenever VS Code changes one.
+    pub fn set_breakpoints(
+        &self,
+        session: &DebugUiSession,
+        modules: &[ModuleBreakpoints],
+    ) -> Result<()> {
+        self.post_xml("setBreakpoints", &breakpoints_request(session, modules))
+            .map(|_| ())
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
@@ -306,6 +337,49 @@ fn step_request(session: &DebugUiSession, target_id: &str, action: StepAction) -
             xml_escape(target_id),
             action.rdbg_value()
         ),
+        1,
+    )
+}
+
+fn breakpoints_request(session: &DebugUiSession, modules: &[ModuleBreakpoints]) -> String {
+    let workspace = modules
+        .iter()
+        .map(|module| {
+            let module_type = if module.extension_name.is_empty() {
+                "ConfigModule"
+            } else {
+                "ExtensionModule"
+            };
+            let breakpoints = module
+                .breakpoints
+                .iter()
+                .map(|breakpoint| {
+                    let condition = breakpoint.condition.as_deref().unwrap_or_default();
+                    let log_message = breakpoint.log_message.as_deref().unwrap_or_default();
+                    let hit_count = breakpoint.hit_condition.unwrap_or(1);
+                    let is_conditional = breakpoint.condition.is_some();
+                    let has_hit_count = breakpoint.hit_condition.is_some();
+                    let is_log_point = breakpoint.log_message.is_some();
+                    format!(
+                        "<bpInfo><line>{}</line><isActive>true</isActive><breakOnCondition>{is_conditional}</breakOnCondition><condition>{}</condition><breakOnParentMethod>false</breakOnParentMethod><parentMethod></parentMethod><breakOnHitCount>{has_hit_count}</breakOnHitCount><hitCountVariant>0</hitCountVariant><hitCount>{hit_count}</hitCount><showOutputMessage>{is_log_point}</showOutputMessage><putDescription></putDescription><putExpressionResult>{}</putExpressionResult><putStackTrace>false</putStackTrace><putHitCount>false</putHitCount><continueExecution>{is_log_point}</continueExecution><currentHitCounter>0</currentHitCounter><temp>false</temp><user>true</user></bpInfo>",
+                        breakpoint.line,
+                        xml_escape(condition),
+                        xml_escape(log_message),
+                    )
+                })
+                .collect::<String>();
+            format!(
+                "<moduleBPInfo xmlns=\"http://v8.1c.ru/8.3/debugger/debugBreakpoints\"><id><type>{module_type}</type><URL></URL><extensionName>{}</extensionName><objectID>{}</objectID><propertyID>{}</propertyID><extId>0</extId><version></version></id>{breakpoints}</moduleBPInfo>",
+                xml_escape(&module.extension_name),
+                xml_escape(&module.object_id),
+                xml_escape(&module.property_id),
+            )
+        })
+        .collect::<String>();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!("<bpWorkspace>{workspace}</bpWorkspace></request>"),
         1,
     )
 }
@@ -508,6 +582,36 @@ mod tests {
 
         assert!(xml.contains("<targetID><id>target-1</id></targetID>"));
         assert!(xml.contains("<action>StepIn</action>"));
+    }
+
+    #[test]
+    fn serializes_conditional_and_log_breakpoints() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = breakpoints_request(
+            &session,
+            &[ModuleBreakpoints {
+                extension_name: String::new(),
+                object_id: "object-id".to_owned(),
+                property_id: "property-id".to_owned(),
+                breakpoints: vec![SourceBreakpoint {
+                    line: 42,
+                    condition: Some("A < 3".to_owned()),
+                    hit_condition: Some(5),
+                    log_message: Some("A={A}".to_owned()),
+                }],
+            }],
+        );
+
+        assert!(xml.contains("<bpWorkspace>"));
+        assert!(xml.contains("<type>ConfigModule</type>"));
+        assert!(xml.contains("<line>42</line>"));
+        assert!(xml.contains("<condition>A &lt; 3</condition>"));
+        assert!(xml.contains("<hitCount>5</hitCount>"));
+        assert!(xml.contains("<putExpressionResult>A={A}</putExpressionResult>"));
+        assert!(xml.contains("<continueExecution>true</continueExecution>"));
     }
 
     #[test]
