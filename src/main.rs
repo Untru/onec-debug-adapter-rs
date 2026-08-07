@@ -144,6 +144,10 @@ fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Res
             executable.display()
         );
     }
+    let debugger_url = server
+        .endpoint()
+        .strip_suffix("/e1crdbg")
+        .unwrap_or(server.endpoint());
     Command::new(&executable)
         .args([
             "/IBName",
@@ -157,7 +161,7 @@ fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Res
             "-http",
             "-attach",
             "/DEBUGGERURL",
-            &format!("http://{}", server.endpoint().trim_end_matches("/e1crdbg")),
+            debugger_url,
             "/O",
             "Normal",
         ])
