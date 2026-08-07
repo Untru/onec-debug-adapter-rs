@@ -14,6 +14,7 @@ const RDBG_REQUEST_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugRDBGRequ
 const AUTO_ATTACH_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugAutoAttach";
 const BREAKPOINTS_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBreakpoints";
 const DEBUG_BASE_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBaseData";
+const DEBUG_CALCULATIONS_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugCalculations";
 
 /// A successfully registered 1C Debug UI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -505,7 +506,7 @@ fn step_request(session: &DebugUiSession, target_id: &str, action: StepAction) -
     base.replacen(
         "</request>",
         &format!(
-            "<targetID><id>{}</id></targetID><action>{}</action><simple>false</simple></request>",
+            "<targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</id></targetID><action>{}</action><simple>false</simple></request>",
             xml_escape(target_id),
             action.rdbg_value()
         ),
@@ -613,7 +614,7 @@ fn evaluation_request(
     base.replacen(
         "</request>",
         &format!(
-            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID>{items}<interfaces>{interface}</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
+            "<calcWaitingTime>100</calcWaitingTime><targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</id></targetID><expr><stackLevel xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\">{}</stackLevel><srcCalcInfo xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\"><expressionResultID>{result_id}</expressionResultID>{items}<interfaces>{interface}</interfaces></srcCalcInfo><presOptions xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\"><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
             xml_escape(target_id),
             stack_level.max(0),
         ),
@@ -631,7 +632,7 @@ fn local_variables_request(
     base.replacen(
         "</request>",
         &format!(
-            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID><interfaces>context</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
+            "<calcWaitingTime>100</calcWaitingTime><targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</id></targetID><expr><stackLevel xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\">{}</stackLevel><srcCalcInfo xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\"><expressionResultID>{result_id}</expressionResultID><interfaces>context</interfaces></srcCalcInfo><presOptions xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\"><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
             xml_escape(target_id),
             stack_level.max(0),
         ),
@@ -1175,7 +1176,9 @@ mod tests {
         };
         let xml = step_request(&session, "target-1", StepAction::StepIn);
 
-        assert!(xml.contains("<targetID><id>target-1</id></targetID>"));
+        assert!(xml.contains(&format!(
+            "<targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">target-1</id></targetID>"
+        )));
         assert!(xml.contains("<action>StepIn</action>"));
     }
 
@@ -1266,7 +1269,12 @@ mod tests {
             EvaluationInterface::Context,
         );
         assert!(xml.contains("<calcWaitingTime>100</calcWaitingTime>"));
-        assert!(xml.contains("<stackLevel>2</stackLevel>"));
+        assert!(xml.contains(&format!(
+            "<targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">target-1</id></targetID>"
+        )));
+        assert!(xml.contains(&format!(
+            "<stackLevel xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\">2</stackLevel>"
+        )));
         assert!(xml.contains("<expression>A &lt; 3</expression>"));
 
         let result = parse_evaluation_response(
@@ -1346,7 +1354,9 @@ mod tests {
             info_base_alias: "DemoBase".to_owned(),
         };
         let xml = local_variables_request(&session, "target-1", 0, "request-id");
-        assert!(xml.contains("<stackLevel>0</stackLevel>"));
+        assert!(xml.contains(&format!(
+            "<stackLevel xmlns=\"{DEBUG_CALCULATIONS_NAMESPACE}\">0</stackLevel>"
+        )));
         assert!(xml.contains("<interfaces>context</interfaces>"));
 
         let variables = parse_local_variables_response(
