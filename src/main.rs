@@ -257,7 +257,7 @@ fn terminate_child(child: &mut Child) {
 fn platform_bin(platform_path: &Path, requested_version: Option<&str>) -> Result<PathBuf> {
     let executable_name = if cfg!(windows) { "1cv8c.exe" } else { "1cv8c" };
     if platform_path.join(executable_name).is_file() {
-        return Ok(platform_path.clone());
+        return Ok(platform_path.to_path_buf());
     }
     let mut versions = fs::read_dir(platform_path)
         .with_context(|| format!("cannot read platformPath {}", platform_path.display()))?
