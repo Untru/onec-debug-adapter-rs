@@ -370,8 +370,10 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
             })
         })
         .flatten();
-    let is_file =
-        direct_file_path.is_some() || launcher_target.as_ref().is_some_and(|target| target.is_file);
+    let is_file = direct_file_path.is_some()
+        || launcher_target
+            .as_ref()
+            .is_some_and(|target| target.is_file);
     let alias = if is_file {
         FILE_INFOBASE_ALIAS.to_owned()
     } else {
