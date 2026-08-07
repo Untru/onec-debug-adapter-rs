@@ -22,6 +22,7 @@ pub struct DebugUiSession {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DebugUiEvent {
     pub command_id: String,
+    pub target_id: Option<String>,
 }
 
 impl DebugUiSession {
@@ -172,10 +173,20 @@ impl DebugServer {
             session.id()
         );
         let response = self.post_empty(&url, "pingDebugUIParams")?;
-        Ok(response_elements(&response, "cmdID")?
-            .into_iter()
-            .map(|command_id| DebugUiEvent { command_id })
-            .collect())
+        parse_debug_ui_events(&response)
+    }
+
+    /// Attaches the Debug UI to the supplied execution contexts.
+    pub fn attach_debug_targets(
+        &self,
+        session: &DebugUiSession,
+        target_ids: &[String],
+    ) -> Result<()> {
+        if target_ids.is_empty() {
+            return Ok(());
+        }
+        let body = debug_target_request(session, true, target_ids);
+        self.post_xml("attachDetachDbgTargets", &body).map(|_| ())
     }
 
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
@@ -237,6 +248,19 @@ fn auto_attach_settings_request(session: &DebugUiSession, types: &[String]) -> S
     )
 }
 
+fn debug_target_request(session: &DebugUiSession, attach: bool, target_ids: &[String]) -> String {
+    let targets = target_ids
+        .iter()
+        .map(|target_id| format!("<id><id>{}</id></id>", xml_escape(target_id)))
+        .collect::<String>();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!("<attach>{attach}</attach>{targets}</request>"),
+        1,
+    )
+}
+
 fn debug_target_type_xml_value(target_type: &str) -> Result<&'static str> {
     match target_type {
         "Client" => Ok("Client"),
@@ -279,24 +303,61 @@ fn response_element(xml: &str, expected_element: &str) -> Result<String> {
     }
 }
 
-fn response_elements(xml: &str, expected_element: &str) -> Result<Vec<String>> {
+fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
-    let mut values = Vec::new();
+    let mut depth = 0usize;
+    let mut event_depth = None;
+    let mut target_depth = None;
+    let mut current_event = None;
+    let mut events = Vec::new();
 
     loop {
         match reader.read_event()? {
-            Event::Start(element)
-                if element.local_name().as_ref() == expected_element.as_bytes() =>
-            {
-                values.push(
-                    reader
-                        .read_text(element.name())
-                        .map(|text| text.into_owned())
-                        .context("cannot read XML response value")?,
-                );
+            Event::Start(element) => {
+                depth += 1;
+                let name = element.local_name();
+                if name.as_ref() == b"result" && depth == 2 {
+                    event_depth = Some(depth);
+                    current_event = Some(DebugUiEvent {
+                        command_id: String::new(),
+                        target_id: None,
+                    });
+                } else if current_event.is_some() && name.as_ref() == b"targetID" {
+                    target_depth = Some(depth);
+                } else if let Some(event) = &mut current_event {
+                    if name.as_ref() == b"cmdID" {
+                        event.command_id = reader
+                            .read_text(element.name())
+                            .map(|text| text.into_owned())
+                            .context("cannot read Debug UI command id")?;
+                        depth -= 1;
+                    } else if name.as_ref() == b"id" && target_depth.is_some() {
+                        event.target_id = Some(
+                            reader
+                                .read_text(element.name())
+                                .map(|text| text.into_owned())
+                                .context("cannot read Debug UI target id")?,
+                        );
+                        depth -= 1;
+                    }
+                }
             }
-            Event::Eof => return Ok(values),
+            Event::End(element) => {
+                if element.local_name().as_ref() == b"targetID" {
+                    target_depth = None;
+                }
+                if event_depth == Some(depth) && element.local_name().as_ref() == b"result" {
+                    if let Some(event) = current_event.take() {
+                        if !event.command_id.is_empty() {
+                            events.push(event);
+                        }
+                    }
+                    event_depth = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            Event::Eof => return Ok(events),
             _ => {}
         }
     }
@@ -338,14 +399,6 @@ mod tests {
     fn parses_namespaced_response_result() {
         let xml = "<response xmlns=\"http://v8.1c.ru/8.3/debugger/debugBaseData\"><result>registered</result></response>";
         assert_eq!(response_element(xml, "result").unwrap(), "registered");
-        assert_eq!(
-            response_elements(
-                "<response><result><cmdID>targetStarted</cmdID><cmdID>targetQuit</cmdID></result></response>",
-                "cmdID"
-            )
-            .unwrap(),
-            vec!["targetStarted".to_owned(), "targetQuit".to_owned()]
-        );
     }
 
     #[test]
@@ -375,6 +428,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_target_lifecycle_events() {
+        let events = parse_debug_ui_events(
+            "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result><result><cmdID>targetQuit</cmdID><targetID><id>target-1</id></targetID></result></response>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            events,
+            vec![
+                DebugUiEvent {
+                    command_id: "targetStarted".to_owned(),
+                    target_id: Some("target-1".to_owned()),
+                },
+                DebugUiEvent {
+                    command_id: "targetQuit".to_owned(),
+                    target_id: Some("target-1".to_owned()),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn attaches_and_detaches_using_the_rdbg_http_endpoints() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -383,7 +458,8 @@ mod tests {
                 "",
                 "<response><result>registered</result></response>",
                 "<response></response>",
-                "<response><result><cmdID>targetStarted</cmdID></result></response>",
+                "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result></response>",
+                "<response></response>",
                 "<response><result>true</result></response>",
             ];
             let mut requests = Vec::new();
@@ -433,9 +509,13 @@ mod tests {
         assert_eq!(
             server.ping_debug_ui(&session).unwrap(),
             vec![DebugUiEvent {
-                command_id: "targetStarted".to_owned()
+                command_id: "targetStarted".to_owned(),
+                target_id: Some("target-1".to_owned()),
             }]
         );
+        server
+            .attach_debug_targets(&session, &["target-1".to_owned()])
+            .unwrap();
         server.detach_debug_ui(&session).unwrap();
         let requests = server_thread.join().unwrap();
 
@@ -447,8 +527,10 @@ mod tests {
         assert!(requests[2].contains("<targetType>Client</targetType>"));
         assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
         assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
-        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[4].contains(&format!(
+        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
+        assert!(requests[4].contains("<attach>true</attach><id><id>target-1</id></id>"));
+        assert!(requests[5].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[5].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));

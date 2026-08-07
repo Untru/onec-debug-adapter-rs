@@ -6,6 +6,7 @@ use dap::{Reader, Writer, error_response, event, response};
 use debug_server::{DebugServer, DebugUiSession};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::io::{self, stderr};
 use std::sync::mpsc;
 use std::thread;
@@ -17,6 +18,7 @@ struct Adapter {
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
     poll_failed: bool,
+    threads: BTreeMap<String, i64>,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +66,12 @@ impl Adapter {
             "threads" => vec![response(
                 request,
                 self.next_sequence(),
-                json!({ "threads": [] }),
+                json!({
+                    "threads": self.threads.iter().map(|(target_id, thread_id)| json!({
+                        "id": thread_id,
+                        "name": format!("1C target {target_id}"),
+                    })).collect::<Vec<_>>(),
+                }),
             )],
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
@@ -117,6 +124,7 @@ impl Adapter {
         self.debug_session = None;
         self.debug_server = None;
         self.poll_failed = false;
+        self.threads.clear();
         Ok(())
     }
 
@@ -124,20 +132,20 @@ impl Adapter {
         let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
             return Vec::new();
         };
+        let server = server.clone();
+        let session = session.clone();
 
-        match server.ping_debug_ui(session) {
+        match server.ping_debug_ui(&session) {
             Ok(events) => {
                 self.poll_failed = false;
                 events
                     .into_iter()
-                    .map(|debug_event| {
-                        event(
-                            self.next_sequence(),
-                            "output",
-                            json!({
-                                "category": "console",
-                                "output": format!("1C debug event: {}\\n", debug_event.command_id),
-                            }),
+                    .flat_map(|debug_event| {
+                        self.handle_debug_event(
+                            &server,
+                            &session,
+                            debug_event.command_id,
+                            debug_event.target_id,
                         )
                     })
                     .collect()
@@ -155,6 +163,55 @@ impl Adapter {
             }
             Err(_) => Vec::new(),
         }
+    }
+
+    fn handle_debug_event(
+        &mut self,
+        server: &DebugServer,
+        session: &DebugUiSession,
+        command_id: String,
+        target_id: Option<String>,
+    ) -> Vec<Value> {
+        match (command_id.as_str(), target_id) {
+            ("targetStarted", Some(target_id)) => {
+                if self.threads.contains_key(&target_id) {
+                    return Vec::new();
+                }
+                if let Err(error) =
+                    server.attach_debug_targets(session, std::slice::from_ref(&target_id))
+                {
+                    return vec![
+                        self.output_event("stderr", format!("cannot attach 1C target: {error}\\n")),
+                    ];
+                }
+                let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
+                self.threads.insert(target_id, thread_id);
+                vec![event(
+                    self.next_sequence(),
+                    "thread",
+                    json!({ "reason": "started", "threadId": thread_id }),
+                )]
+            }
+            ("targetQuit", Some(target_id)) => match self.threads.remove(&target_id) {
+                Some(thread_id) => vec![event(
+                    self.next_sequence(),
+                    "thread",
+                    json!({ "reason": "exited", "threadId": thread_id }),
+                )],
+                None => Vec::new(),
+            },
+            (command_id, _) => {
+                vec![self.output_event("console", format!("1C debug event: {command_id}\\n"))]
+            }
+        }
+    }
+
+    fn output_event(&mut self, category: &str, output: String) -> Value {
+        event(
+            self.next_sequence(),
+            "output",
+            json!({ "category": category, "output": output }),
+        )
     }
 }
 
