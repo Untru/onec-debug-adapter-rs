@@ -45,6 +45,58 @@ fn binary_serves_initialize_over_dap_stdio() {
 }
 
 #[cfg(unix)]
+#[test]
+fn adapter_detaches_debug_ui_when_dap_input_closes() {
+    let rdbg = FakeRdbgServer::start();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#,
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"initialize\""));
+    send_dap_request(
+        &mut stdin,
+        &format!(
+            r#"{{
+                "seq":2,
+                "type":"request",
+                "command":"attach",
+                "arguments":{{
+                    "infoBaseAlias":"Probe",
+                    "debugServerHost":"127.0.0.1",
+                    "debugServerPort":{}
+                }}
+            }}"#,
+            rdbg.port
+        ),
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"attach\""));
+    assert!(read_dap_message(&mut stdout).contains("\"event\":\"initialized\""));
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+
+    let requests = rdbg.requests.lock().unwrap().clone();
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("cmd=attachDebugUI"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("cmd=detachDebugUI"))
+    );
+    rdbg.shutdown();
+}
+
+#[cfg(unix)]
 struct FakeRdbgServer {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,

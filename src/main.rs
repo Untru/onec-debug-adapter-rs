@@ -1510,6 +1510,7 @@ fn main() -> Result<()> {
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+    let _ = adapter.disconnect();
     let _ = stderr();
     Ok(())
 }
