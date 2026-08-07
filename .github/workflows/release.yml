@@ -18,6 +18,9 @@ jobs:
           - os: ubuntu-24.04
             rid: linux-x64
             binary: onec-debug-adapter
+          - os: ubuntu-24.04-arm
+            rid: linux-arm64
+            binary: onec-debug-adapter
           - os: windows-2025
             rid: win32-x64
             binary: onec-debug-adapter.exe
@@ -34,6 +37,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Smoke test native DAP adapter
+        run: cargo test --locked
       - run: cargo build --locked --release
       - name: Bundle native adapter
         shell: bash
