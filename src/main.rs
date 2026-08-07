@@ -22,6 +22,7 @@ struct ConnectionArguments {
     debug_server_port: u16,
     info_base: Option<String>,
     info_base_alias: Option<String>,
+    auto_attach_types: Option<Vec<String>>,
 }
 
 impl Adapter {
@@ -91,6 +92,9 @@ impl Adapter {
             .or(arguments.info_base.as_deref())
             .context("launch/attach requires infoBase or infoBaseAlias")?;
         let session = server.attach_debug_ui(info_base_alias)?;
+        if let Some(types) = &arguments.auto_attach_types {
+            server.set_auto_attach_types(&session, types)?;
+        }
         eprintln!(
             "attached Debug UI {} to 1C debug server: {}",
             session.id(),

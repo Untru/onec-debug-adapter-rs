@@ -146,6 +146,17 @@ impl DebugServer {
         Ok(())
     }
 
+    /// Configures which 1C execution contexts are automatically attached to
+    /// this Debug UI. The spellings intentionally match `autoAttachTypes` in
+    /// the existing VS Code extension.
+    pub fn set_auto_attach_types(&self, session: &DebugUiSession, types: &[String]) -> Result<()> {
+        for target_type in types {
+            debug_target_type_xml_value(target_type)?;
+        }
+        let body = auto_attach_settings_request(session, types);
+        self.post_xml("setAutoAttachSettings", &body).map(|_| ())
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
@@ -174,6 +185,46 @@ fn base_request(session: &DebugUiSession) -> String {
         xml_escape(session.info_base_alias()),
         xml_escape(session.id())
     )
+}
+
+fn auto_attach_settings_request(session: &DebugUiSession, types: &[String]) -> String {
+    let target_types = types
+        .iter()
+        .map(|target_type| {
+            format!(
+                "<targetType>{}</targetType>",
+                debug_target_type_xml_value(target_type).expect("validated before serialization")
+            )
+        })
+        .collect::<String>();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!("<autoAttachSettings>{target_types}</autoAttachSettings></request>"),
+        1,
+    )
+}
+
+fn debug_target_type_xml_value(target_type: &str) -> Result<&'static str> {
+    match target_type {
+        "Client" => Ok("Client"),
+        "ManagedClient" => Ok("ManagedClient"),
+        "Server" => Ok("Server"),
+        "ServerEmulation" => Ok("ServerEmulation"),
+        "OData" => Ok("OData"),
+        "JobFileMode" => Ok("JobFileMode"),
+        "MobileClient" => Ok("MobileClient"),
+        "MobileServer" => Ok("MobileServer"),
+        "MobileJobFileMode" => Ok("MobileJobFileMode"),
+        "MobileManagedClient" => Ok("MobileManagedClient"),
+        "MobileManagedServer" => Ok("MobileManagedServer"),
+        "WebClient" => Ok("WEBClient"),
+        "ComConnector" => Ok("COMConnector"),
+        "WebService" => Ok("WEBService"),
+        "HttpService" => Ok("HTTPService"),
+        "Job" => Ok("JOB"),
+        other => bail!("unsupported autoAttachTypes value `{other}`"),
+    }
 }
 
 fn response_element(xml: &str, expected_element: &str) -> Result<String> {
@@ -248,6 +299,13 @@ mod tests {
     }
 
     #[test]
+    fn converts_vscode_auto_attach_types_to_rdbg_values() {
+        assert_eq!(debug_target_type_xml_value("HttpService").unwrap(), "HTTPService");
+        assert_eq!(debug_target_type_xml_value("WebClient").unwrap(), "WEBClient");
+        assert!(debug_target_type_xml_value("Unknown").is_err());
+    }
+
+    #[test]
     fn attaches_and_detaches_using_the_rdbg_http_endpoints() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -255,6 +313,7 @@ mod tests {
             let responses = [
                 "",
                 "<response><result>registered</result></response>",
+                "<response></response>",
                 "<response><result>true</result></response>",
             ];
             let mut requests = Vec::new();
@@ -298,6 +357,9 @@ mod tests {
 
         let server = DebugServer::new("127.0.0.1", port).unwrap();
         let session = server.attach_debug_ui("DemoBase").unwrap();
+        server
+            .set_auto_attach_types(&session, &["Client".to_owned(), "HttpService".to_owned()])
+            .unwrap();
         server.detach_debug_ui(&session).unwrap();
         let requests = server_thread.join().unwrap();
 
@@ -305,8 +367,11 @@ mod tests {
         assert!(requests[1].starts_with("POST /e1crdbg/rdbg?cmd=attachDebugUI HTTP/1.1"));
         assert!(requests[1].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
         assert!(requests[1].contains("<foregroundAbility>true</foregroundAbility>"));
-        assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[2].contains(&format!(
+        assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=setAutoAttachSettings HTTP/1.1"));
+        assert!(requests[2].contains("<targetType>Client</targetType>"));
+        assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
+        assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[3].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));
