@@ -10,10 +10,10 @@
 
 - строгое чтение и запись DAP-сообщений по `stdin`/`stdout`;
 - `initialize`, `launch`/`attach`, `configurationDone`, `threads`, `disconnect` и `terminate`;
-- проверка доступности HTTP-сервера 1С перед началом сессии;
+- проверка доступности HTTP-сервера 1С и регистрация/отключение Debug UI;
 - CI с форматированием, Clippy и тестами.
 
-Следующая итерация: XML-модели запросов RDBG, подключение debug UI, список предметов отладки и точки останова. До её завершения адаптер корректно сообщает, что остальные команды пока не реализованы.
+Текущая итерация реализует основу XML-сессии RDBG. Следующая часть: начальные настройки, список предметов отладки и точки останова. До её завершения адаптер корректно сообщает, что остальные команды пока не реализованы.
 
 ## Локальная сборка
 
@@ -30,6 +30,8 @@ cargo build --release
 Готовящееся расширение будет регистрировать тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому существующие `launch.json` сохранят `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; менять нужно будет только установленное расширение. Вместо `dotnet` оно запустит подходящий для ОС нативный бинарник из VSIX.
 
 `attach` работает с сервером отладки на другой машине. Для режима `launch` в будущих версиях локально должна быть установлена платформа 1С соответствующей ОС.
+
+Для подключения укажите `infoBaseAlias` — серверный псевдоним информационной базы. Если он совпадает с `infoBase`, достаточно `infoBase`; иначе `infoBaseAlias` имеет приоритет.
 
 [dap]: https://microsoft.github.io/debug-adapter-protocol/
 [reference]: https://github.com/akpaevj/onec-debug-adapter

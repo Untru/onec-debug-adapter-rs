@@ -5,6 +5,7 @@
       "name": "1C: Attach to debug server",
       "type": "onec",
       "request": "attach",
+      "infoBase": "MyInfoBase",
       "debugServerHost": "localhost",
       "debugServerPort": 1550
     }

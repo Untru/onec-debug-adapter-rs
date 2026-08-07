@@ -3,7 +3,7 @@ mod debug_server;
 
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
-use debug_server::DebugServer;
+use debug_server::{DebugServer, DebugUiSession};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, stderr};
@@ -12,6 +12,7 @@ use std::io::{self, stderr};
 struct Adapter {
     next_sequence: u64,
     debug_server: Option<DebugServer>,
+    debug_session: Option<DebugUiSession>,
 }
 
 #[derive(Deserialize)]
@@ -19,6 +20,8 @@ struct Adapter {
 struct ConnectionArguments {
     debug_server_host: String,
     debug_server_port: u16,
+    info_base: Option<String>,
+    info_base_alias: Option<String>,
 }
 
 impl Adapter {
@@ -58,10 +61,14 @@ impl Adapter {
                 self.next_sequence(),
                 json!({ "threads": [] }),
             )],
-            "disconnect" | "terminate" => {
-                self.debug_server = None;
-                vec![response(request, self.next_sequence(), json!({}))]
-            }
+            "disconnect" | "terminate" => match self.disconnect() {
+                Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
+                Err(error) => vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )],
+            },
             _ => vec![error_response(
                 request,
                 self.next_sequence(),
@@ -71,16 +78,35 @@ impl Adapter {
     }
 
     fn connect(&mut self, request: &Value) -> Result<()> {
-        if self.debug_server.is_some() {
+        if self.debug_session.is_some() {
             anyhow::bail!("a 1C debug server is already attached");
         }
         let arguments: ConnectionArguments =
             serde_json::from_value(request["arguments"].clone())
                 .context("launch/attach requires debugServerHost and debugServerPort")?;
         let server = DebugServer::new(&arguments.debug_server_host, arguments.debug_server_port)?;
-        server.test_connection()?;
-        eprintln!("connected to 1C debug server: {}", server.endpoint());
+        let info_base_alias = arguments
+            .info_base_alias
+            .as_deref()
+            .or(arguments.info_base.as_deref())
+            .context("launch/attach requires infoBase or infoBaseAlias")?;
+        let session = server.attach_debug_ui(info_base_alias)?;
+        eprintln!(
+            "attached Debug UI {} to 1C debug server: {}",
+            session.id(),
+            server.endpoint()
+        );
         self.debug_server = Some(server);
+        self.debug_session = Some(session);
+        Ok(())
+    }
+
+    fn disconnect(&mut self) -> Result<()> {
+        if let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) {
+            server.detach_debug_ui(session)?;
+        }
+        self.debug_session = None;
+        self.debug_server = None;
         Ok(())
     }
 }
