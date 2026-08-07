@@ -242,15 +242,13 @@ impl DebugServer {
         }
     }
 
-    /// Unregisters the supplied Debug UI. A false result is surfaced as an
-    /// error because retaining a stale UI session can prevent the next attach.
+    /// Unregisters the supplied Debug UI.
+    ///
+    /// Some dbgs builds return an empty or false XML result after successfully
+    /// processing the request, so HTTP success is the reliable acknowledgement.
     pub fn detach_debug_ui(&self, session: &DebugUiSession) -> Result<()> {
         let body = base_request(session);
-        let response = self.post_xml("detachDebugUI", &body)?;
-        if response_element(&response, "result")?.trim() != "true" {
-            bail!("1C debug server rejected detachDebugUI")
-        }
-        Ok(())
+        self.post_xml("detachDebugUI", &body).map(|_| ())
     }
 
     /// Configures which 1C execution contexts are automatically attached to
@@ -1248,7 +1246,7 @@ mod tests {
                 "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result></response>",
                 "<response></response>",
                 "<response></response>",
-                "<response><result>true</result></response>",
+                "<response></response>",
             ];
             let mut requests = Vec::new();
 
