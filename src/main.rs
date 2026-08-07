@@ -164,8 +164,11 @@ fn main() -> Result<()> {
         let mut reader = Reader::new(io::stdin().lock());
         loop {
             match reader.read() {
-                Ok(Some(message)) if sender.send(Ok(message.0)).is_err() => break,
-                Ok(Some(_)) => {}
+                Ok(Some(message)) => {
+                    if sender.send(Ok(message.0)).is_err() {
+                        break;
+                    }
+                }
                 Ok(None) => break,
                 Err(error) => {
                     let _ = sender.send(Err(error.to_string()));
