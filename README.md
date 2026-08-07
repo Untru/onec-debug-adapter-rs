@@ -10,7 +10,7 @@
 
 - DAP `launch`, `attach`, breakpoints, exception breakpoints, stepping, pause, threads и disconnect;
 - source/condition/hit-count/logpoint для BSL-модулей основной конфигурации и расширений;
-- событие остановки, stack trace, локальные variables и evaluate/hover;
+- событие остановки, stack trace, раскрываемые локальные variables и evaluate/hover, включая отложенный RDBG `exprEvaluated`;
 - `launch` выбирает `1cv8c` из `platformPath` (указанная версия или `LATEST`) и запускает его с HTTP-отладкой;
 - CI проверяет форматирование, Clippy, unit-тесты и упаковку VSIX.
 

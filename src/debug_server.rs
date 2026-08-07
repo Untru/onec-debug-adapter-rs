@@ -30,6 +30,7 @@ pub struct DebugUiEvent {
     pub send_message_only: bool,
     pub send_hit_counter_only: bool,
     pub message: Option<String>,
+    pub evaluation: Option<DebugEvaluation>,
 }
 
 /// One call-stack item sent by RDBG as part of a `callStackFormed` event.
@@ -43,11 +44,15 @@ pub struct DebugStackFrame {
 }
 
 /// A scalar result returned by RDBG expression evaluation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DebugEvaluation {
+    pub result_id: String,
     pub value: String,
     pub type_name: String,
     pub error: Option<String>,
+    pub is_expandable: bool,
+    pub is_indexed_collection: bool,
+    pub variables: Vec<DebugVariable>,
 }
 
 /// A readable property in the local context of a stopped 1C stack frame.
@@ -56,6 +61,31 @@ pub struct DebugVariable {
     pub name: String,
     pub type_name: String,
     pub value: String,
+    pub index: Option<i64>,
+    pub is_expandable: bool,
+    pub is_indexed_collection: bool,
+}
+
+/// An item in a calculation path used to obtain the children of a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CalculationPathItem {
+    Expression(String),
+    Property(String),
+    Index(i64),
+}
+
+/// Whether RDBG should describe an object context or an indexed collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationInterface {
+    Context,
+    Collection,
+}
+
+/// Immediate or deferred response to an expression request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluationStart<T> {
+    pub result_id: String,
+    pub result: Option<T>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,34 +334,65 @@ impl DebugServer {
         .map(|_| ())
     }
 
-    /// Evaluates an expression synchronously in a stopped target stack frame.
-    /// RDBG can choose to answer later through `exprEvaluated`; callers receive
-    /// an explicit error in that rare case rather than a fabricated value.
-    pub fn evaluate_expression(
+    /// Starts evaluating an expression in a stopped target stack frame.
+    ///
+    /// RDBG normally answers in this HTTP response, but older servers may
+    /// defer it and deliver `exprEvaluated` from `pingDebugUIParams` instead.
+    pub fn begin_evaluate_expression(
         &self,
         session: &DebugUiSession,
         target_id: &str,
         stack_level: i64,
         expression: &str,
-    ) -> Result<DebugEvaluation> {
+    ) -> Result<EvaluationStart<DebugEvaluation>> {
         if expression.trim().is_empty() {
             bail!("expression must not be empty");
         }
-        let body = evaluation_request(session, target_id, stack_level, expression);
-        let response = self.post_xml("evalExpr", &body)?;
-        parse_evaluation_response(&response)
+        self.begin_evaluate_path(
+            session,
+            target_id,
+            stack_level,
+            &[CalculationPathItem::Expression(expression.to_owned())],
+            EvaluationInterface::Context,
+        )
     }
 
-    /// Retrieves readable local variables for a stopped target stack frame.
-    pub fn evaluate_local_variables(
+    /// Starts evaluating a path to obtain the children of an expandable value.
+    pub fn begin_evaluate_path(
         &self,
         session: &DebugUiSession,
         target_id: &str,
         stack_level: i64,
-    ) -> Result<Vec<DebugVariable>> {
-        let body = local_variables_request(session, target_id, stack_level);
+        path: &[CalculationPathItem],
+        interface: EvaluationInterface,
+    ) -> Result<EvaluationStart<DebugEvaluation>> {
+        if path.is_empty() {
+            bail!("calculation path must not be empty");
+        }
+        let result_id = Uuid::new_v4().to_string();
+        let body = evaluation_request(session, target_id, stack_level, &result_id, path, interface);
+        let response = self.post_xml("evalExpr", &body)?;
+        Ok(EvaluationStart {
+            result_id,
+            result: parse_evaluation_response(&response)?,
+        })
+    }
+
+    /// Starts retrieving readable local variables for a stopped target stack
+    /// frame. The result can likewise be delivered by `exprEvaluated`.
+    pub fn begin_evaluate_local_variables(
+        &self,
+        session: &DebugUiSession,
+        target_id: &str,
+        stack_level: i64,
+    ) -> Result<EvaluationStart<Vec<DebugVariable>>> {
+        let result_id = Uuid::new_v4().to_string();
+        let body = local_variables_request(session, target_id, stack_level, &result_id);
         let response = self.post_xml("evalLocalVariables", &body)?;
-        parse_local_variables_response(&response)
+        Ok(EvaluationStart {
+            result_id,
+            result: parse_local_variables_response(&response)?,
+        })
     }
 
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
@@ -491,24 +552,48 @@ fn evaluation_request(
     session: &DebugUiSession,
     target_id: &str,
     stack_level: i64,
-    expression: &str,
+    result_id: &str,
+    path: &[CalculationPathItem],
+    interface: EvaluationInterface,
 ) -> String {
-    let result_id = Uuid::new_v4();
+    let items = path
+        .iter()
+        .map(|item| match item {
+            CalculationPathItem::Expression(expression) => format!(
+                "<calcItem><itemType>expression</itemType><expression>{}</expression><property></property></calcItem>",
+                xml_escape(expression)
+            ),
+            CalculationPathItem::Property(property) => format!(
+                "<calcItem><itemType>property</itemType><expression></expression><property>{}</property></calcItem>",
+                xml_escape(property)
+            ),
+            CalculationPathItem::Index(index) => format!(
+                "<calcItem><itemType>index</itemType><expression></expression><property></property><index>{index}</index></calcItem>"
+            ),
+        })
+        .collect::<String>();
+    let interface = match interface {
+        EvaluationInterface::Context => "context",
+        EvaluationInterface::Collection => "collection",
+    };
     let base = base_request(session);
     base.replacen(
         "</request>",
         &format!(
-            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID><calcItem><itemType>expression</itemType><expression>{}</expression><property></property></calcItem><interfaces>context</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
+            "<calcWaitingTime>100</calcWaitingTime><targetID><id>{}</id></targetID><expr><stackLevel>{}</stackLevel><srcCalcInfo><expressionResultID>{result_id}</expressionResultID>{items}<interfaces>{interface}</interfaces></srcCalcInfo><presOptions><maxTextSize>307200</maxTextSize><stopOnFirstEOL>false</stopOnFirstEOL></presOptions></expr></request>",
             xml_escape(target_id),
             stack_level.max(0),
-            xml_escape(expression),
         ),
         1,
     )
 }
 
-fn local_variables_request(session: &DebugUiSession, target_id: &str, stack_level: i64) -> String {
-    let result_id = Uuid::new_v4();
+fn local_variables_request(
+    session: &DebugUiSession,
+    target_id: &str,
+    stack_level: i64,
+    result_id: &str,
+) -> String {
     let base = base_request(session);
     base.replacen(
         "</request>",
@@ -521,19 +606,27 @@ fn local_variables_request(session: &DebugUiSession, target_id: &str, stack_leve
     )
 }
 
-fn parse_evaluation_response(xml: &str) -> Result<DebugEvaluation> {
+fn parse_evaluation_response(xml: &str) -> Result<Option<DebugEvaluation>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut names = Vec::<String>::new();
+    let mut saw_result = false;
+    let mut result_id = String::new();
     let mut error_occurred = false;
     let mut value = None;
     let mut type_name = None;
     let mut error = None;
+    let mut is_expandable = false;
+    let mut is_indexed_collection = false;
 
     loop {
         match reader.read_event()? {
             Event::Start(element) => {
-                names.push(String::from_utf8_lossy(element.local_name().as_ref()).into_owned());
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "result" {
+                    saw_result = true;
+                }
+                names.push(name);
             }
             Event::End(_) => {
                 names.pop();
@@ -546,11 +639,17 @@ fn parse_evaluation_response(xml: &str) -> Result<DebugEvaluation> {
                     .unescape()
                     .map(|text| text.into_owned())
                     .context("cannot decode expression evaluation response")?;
+                let result_value = names.iter().any(|entry| entry == "resultValueInfo");
                 match name {
+                    "expressionResultID" => result_id = text,
                     "errorOccurred" => error_occurred = xml_bool(&text),
-                    "typeName" => type_name = Some(text),
-                    "pres" => value = Some(decode_base64_text(&text)),
+                    "typeName" if result_value => type_name = Some(text),
+                    "pres" if result_value => value = Some(decode_base64_text(&text)),
                     "exceptionStr" => error = Some(decode_base64_text(&text)),
+                    "isExpandable" if result_value => is_expandable = xml_bool(&text),
+                    "isIIndexedCollectionRO" if result_value => {
+                        is_indexed_collection = xml_bool(&text)
+                    }
                     _ => {}
                 }
             }
@@ -559,25 +658,33 @@ fn parse_evaluation_response(xml: &str) -> Result<DebugEvaluation> {
         }
     }
 
-    if value.is_none() && error.is_none() && !error_occurred {
-        bail!(
-            "1C debug server deferred expression evaluation; asynchronous result is not available"
-        )
+    if !saw_result {
+        return Ok(None);
     }
-    Ok(DebugEvaluation {
+    Ok(Some(DebugEvaluation {
+        result_id,
         value: value.unwrap_or_default(),
         type_name: type_name.unwrap_or_default(),
         error: error_occurred
             .then_some(error.unwrap_or_else(|| "expression evaluation failed".to_owned())),
-    })
+        is_expandable,
+        is_indexed_collection,
+        variables: parse_context_variables(xml)?,
+    }))
 }
 
-fn parse_local_variables_response(xml: &str) -> Result<Vec<DebugVariable>> {
+fn parse_local_variables_response(xml: &str) -> Result<Option<Vec<DebugVariable>>> {
+    let saw_result = xml.contains("<result") || xml.contains(":result");
+    saw_result.then(|| parse_context_variables(xml)).transpose()
+}
+
+fn parse_context_variables(xml: &str) -> Result<Vec<DebugVariable>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
     let mut names = Vec::<String>::new();
     let mut current = None;
     let mut variables = Vec::new();
+    let mut collection_index = 0_i64;
 
     loop {
         match reader.read_event()? {
@@ -585,11 +692,21 @@ fn parse_local_variables_response(xml: &str) -> Result<Vec<DebugVariable>> {
                 let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
                 if name == "valueOfContextPropInfo" {
                     current = Some(DebugVariable::default());
+                } else if name == "valueOfCollectionInfo" {
+                    current = Some(DebugVariable {
+                        name: collection_index.to_string(),
+                        index: Some(collection_index),
+                        ..DebugVariable::default()
+                    });
+                    collection_index += 1;
                 }
                 names.push(name);
             }
             Event::End(element) => {
-                if element.local_name().as_ref() == b"valueOfContextPropInfo" {
+                if matches!(
+                    element.local_name().as_ref(),
+                    b"valueOfContextPropInfo" | b"valueOfCollectionInfo"
+                ) {
                     if let Some(variable) = current.take() {
                         if !variable.name.is_empty() {
                             variables.push(variable);
@@ -613,6 +730,8 @@ fn parse_local_variables_response(xml: &str) -> Result<Vec<DebugVariable>> {
                     "propName" => variable.name = text,
                     "typeName" => variable.type_name = text,
                     "pres" | "errorStr" => variable.value = decode_base64_text(&text),
+                    "isExpandable" => variable.is_expandable = xml_bool(&text),
+                    "isIIndexedCollectionRO" => variable.is_indexed_collection = xml_bool(&text),
                     _ => {}
                 }
             }
@@ -679,6 +798,8 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
     let mut names = Vec::<String>::new();
     let mut current_event = None;
     let mut current_stack_frame = None;
+    let mut current_evaluation_variable = None;
+    let mut evaluation_collection_index = 0_i64;
     let mut events = Vec::new();
 
     loop {
@@ -691,6 +812,16 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                 } else if current_event.is_some() && name == "callStack" {
                     current_stack_frame = Some(DebugStackFrame::default());
                 }
+                if current_stack_frame.is_none() && name == "valueOfContextPropInfo" {
+                    current_evaluation_variable = Some(DebugVariable::default());
+                } else if current_stack_frame.is_none() && name == "valueOfCollectionInfo" {
+                    current_evaluation_variable = Some(DebugVariable {
+                        name: evaluation_collection_index.to_string(),
+                        index: Some(evaluation_collection_index),
+                        ..DebugVariable::default()
+                    });
+                    evaluation_collection_index += 1;
+                }
                 names.push(name);
             }
             Event::End(element) => {
@@ -700,6 +831,20 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                         (&mut current_event, current_stack_frame.take())
                     {
                         event.call_stack.push(frame);
+                    }
+                }
+                if matches!(
+                    name.as_str(),
+                    "valueOfContextPropInfo" | "valueOfCollectionInfo"
+                ) {
+                    if let (Some(event), Some(variable)) =
+                        (&mut current_event, current_evaluation_variable.take())
+                    {
+                        if let Some(evaluation) = &mut event.evaluation {
+                            if !variable.name.is_empty() {
+                                evaluation.variables.push(variable);
+                            }
+                        }
                     }
                 }
                 if name == "result" && depth == 2 {
@@ -724,24 +869,29 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                     continue;
                 };
                 match name {
-                    "cmdID" => event.command_id = value,
+                    "cmdID" => {
+                        event.command_id = value.clone();
+                        if event.command_id == "exprEvaluated" {
+                            event.evaluation = Some(DebugEvaluation::default());
+                        }
+                    }
                     "id" if names.iter().any(|name| name == "targetID") => {
-                        event.target_id = Some(value)
+                        event.target_id = Some(value.clone())
                     }
                     "stopByBP" => event.stopped_by_breakpoint = xml_bool(&value),
                     "suspendedByOther" => event.suspended_by_other = xml_bool(&value),
                     "sendMessageOnly" => event.send_message_only = xml_bool(&value),
                     "sendHitCounterOnly" => event.send_hit_counter_only = xml_bool(&value),
-                    "message" => event.message = Some(value),
+                    "message" => event.message = Some(value.clone()),
                     "extensionName" => set_stack_field(&mut current_stack_frame, |frame| {
-                        frame.extension_name = value
+                        frame.extension_name = value.clone()
                     }),
-                    "objectID" => {
-                        set_stack_field(&mut current_stack_frame, |frame| frame.object_id = value)
-                    }
-                    "propertyID" => {
-                        set_stack_field(&mut current_stack_frame, |frame| frame.property_id = value)
-                    }
+                    "objectID" => set_stack_field(&mut current_stack_frame, |frame| {
+                        frame.object_id = value.clone()
+                    }),
+                    "propertyID" => set_stack_field(&mut current_stack_frame, |frame| {
+                        frame.property_id = value.clone()
+                    }),
                     "lineNo" => set_stack_field(&mut current_stack_frame, |frame| {
                         frame.line = value.parse().unwrap_or_default()
                     }),
@@ -750,9 +900,40 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                             .decode(value.as_bytes())
                             .ok()
                             .and_then(|bytes| String::from_utf8(bytes).ok())
-                            .unwrap_or(value)
+                            .unwrap_or_else(|| value.clone())
                     }),
                     _ => {}
+                }
+                if current_stack_frame.is_none() {
+                    if let Some(variable) = &mut current_evaluation_variable {
+                        match name {
+                            "propName" => variable.name = value.clone(),
+                            "typeName" => variable.type_name = value.clone(),
+                            "pres" | "errorStr" => variable.value = decode_base64_text(&value),
+                            "isExpandable" => variable.is_expandable = xml_bool(&value),
+                            "isIIndexedCollectionRO" => {
+                                variable.is_indexed_collection = xml_bool(&value)
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(evaluation) = &mut event.evaluation {
+                        let result_value = names.iter().any(|entry| entry == "resultValueInfo");
+                        match name {
+                            "expressionResultID" => evaluation.result_id = value,
+                            "errorOccurred" => error_flag(&mut evaluation.error, &value),
+                            "typeName" if result_value => evaluation.type_name = value,
+                            "pres" if result_value => evaluation.value = decode_base64_text(&value),
+                            "exceptionStr" => evaluation.error = Some(decode_base64_text(&value)),
+                            "isExpandable" if result_value => {
+                                evaluation.is_expandable = xml_bool(&value)
+                            }
+                            "isIIndexedCollectionRO" if result_value => {
+                                evaluation.is_indexed_collection = xml_bool(&value)
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             Event::Eof => return Ok(events),
@@ -769,6 +950,12 @@ fn set_stack_field(frame: &mut Option<DebugStackFrame>, set: impl FnOnce(&mut De
 
 fn xml_bool(value: &str) -> bool {
     value == "true" || value == "1"
+}
+
+fn error_flag(error: &mut Option<String>, value: &str) {
+    if xml_bool(value) && error.is_none() {
+        *error = Some("expression evaluation failed".to_owned());
+    }
 }
 
 fn xml_escape(value: &str) -> String {
@@ -933,7 +1120,14 @@ mod tests {
             id: "debug-ui".to_owned(),
             info_base_alias: "DemoBase".to_owned(),
         };
-        let xml = evaluation_request(&session, "target-1", 2, "A < 3");
+        let xml = evaluation_request(
+            &session,
+            "target-1",
+            2,
+            "request-id",
+            &[CalculationPathItem::Expression("A < 3".to_owned())],
+            EvaluationInterface::Context,
+        );
         assert!(xml.contains("<calcWaitingTime>100</calcWaitingTime>"));
         assert!(xml.contains("<stackLevel>2</stackLevel>"));
         assert!(xml.contains("<expression>A &lt; 3</expression>"));
@@ -941,10 +1135,71 @@ mod tests {
         let result = parse_evaluation_response(
             "<response><result><errorOccurred>false</errorOccurred><resultValueInfo><typeName>Boolean</typeName><pres>0JjRgdGC0LjQvdCw</pres></resultValueInfo></result></response>",
         )
+        .unwrap()
         .unwrap();
         assert_eq!(result.type_name, "Boolean");
         assert_eq!(result.value, "Истина");
         assert_eq!(result.error, None);
+    }
+
+    #[test]
+    fn supports_deferred_expression_evaluation_events() {
+        assert_eq!(
+            parse_evaluation_response("<response></response>").unwrap(),
+            None
+        );
+
+        let events = parse_debug_ui_events(
+            "<response><result><cmdID>exprEvaluated</cmdID><evalExprResBaseData><expressionResultID>result-1</expressionResultID><errorOccurred>false</errorOccurred><resultValueInfo><typeName>Structure</typeName><pres>VGVzdA==</pres><isExpandable>true</isExpandable><isIIndexedCollectionRO>false</isIIndexedCollectionRO></resultValueInfo><calculationResult><valueOfContextPropInfo><propInfo><propName>Counter</propName></propInfo><valueInfo><typeName>Number</typeName><pres>NDI=</pres></valueInfo></valueOfContextPropInfo></calculationResult></evalExprResBaseData></result></response>",
+        )
+        .unwrap();
+
+        let evaluation = events[0].evaluation.as_ref().unwrap();
+        assert_eq!(evaluation.result_id, "result-1");
+        assert_eq!(evaluation.value, "Test");
+        assert!(evaluation.is_expandable);
+        assert_eq!(evaluation.variables[0].name, "Counter");
+        assert_eq!(evaluation.variables[0].value, "42");
+    }
+
+    #[test]
+    fn serializes_property_and_index_calculation_paths() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = evaluation_request(
+            &session,
+            "target-1",
+            0,
+            "request-id",
+            &[
+                CalculationPathItem::Expression("Items".to_owned()),
+                CalculationPathItem::Property("Owner".to_owned()),
+                CalculationPathItem::Index(3),
+            ],
+            EvaluationInterface::Collection,
+        );
+
+        assert!(xml.contains(
+            "<itemType>property</itemType><expression></expression><property>Owner</property>"
+        ));
+        assert!(xml.contains("<itemType>index</itemType><expression></expression><property></property><index>3</index>"));
+        assert!(xml.contains("<interfaces>collection</interfaces>"));
+    }
+
+    #[test]
+    fn parses_expandable_context_and_collection_values() {
+        let variables = parse_context_variables(
+            "<response><result><calculationResult><valueOfContextPropInfo><propInfo><propName>Document</propName></propInfo><valueInfo><typeName>DocumentObject</typeName><pres>RGVtbw==</pres><isExpandable>true</isExpandable></valueInfo></valueOfContextPropInfo><valueOfCollectionInfo><valueInfo><typeName>String</typeName><pres>Zmlyc3Q=</pres><isIIndexedCollectionRO>true</isIIndexedCollectionRO></valueInfo></valueOfCollectionInfo></calculationResult></result></response>",
+        )
+        .unwrap();
+
+        assert!(variables[0].is_expandable);
+        assert_eq!(variables[0].value, "Demo");
+        assert_eq!(variables[1].index, Some(0));
+        assert!(variables[1].is_indexed_collection);
+        assert_eq!(variables[1].value, "first");
     }
 
     #[test]
@@ -953,7 +1208,7 @@ mod tests {
             id: "debug-ui".to_owned(),
             info_base_alias: "DemoBase".to_owned(),
         };
-        let xml = local_variables_request(&session, "target-1", 0);
+        let xml = local_variables_request(&session, "target-1", 0, "request-id");
         assert!(xml.contains("<stackLevel>0</stackLevel>"));
         assert!(xml.contains("<interfaces>context</interfaces>"));
 
@@ -963,11 +1218,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             variables,
-            vec![DebugVariable {
+            Some(vec![DebugVariable {
                 name: "Counter".to_owned(),
                 type_name: "Number".to_owned(),
                 value: "42".to_owned(),
-            }]
+                ..DebugVariable::default()
+            }])
         );
     }
 

@@ -5,8 +5,9 @@ mod metadata;
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
 use debug_server::{
-    DebugServer, DebugStackFrame, DebugUiEvent, DebugUiSession, ModuleBreakpoints,
-    SourceBreakpoint, StepAction,
+    CalculationPathItem, DebugEvaluation, DebugServer, DebugStackFrame, DebugUiEvent,
+    DebugUiSession, DebugVariable, EvaluationInterface, ModuleBreakpoints, SourceBreakpoint,
+    StepAction,
 };
 use metadata::ModuleRegistry;
 use serde::Deserialize;
@@ -29,8 +30,62 @@ struct Adapter {
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
     call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
+    next_variable_reference: i64,
+    variable_references: BTreeMap<i64, VariableReference>,
+    pending_evaluations: BTreeMap<String, PendingEvaluation>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
+}
+
+#[derive(Clone)]
+enum VariableReference {
+    Locals {
+        thread_id: i64,
+        stack_level: i64,
+    },
+    Value {
+        thread_id: i64,
+        stack_level: i64,
+        path: Vec<CalculationPathItem>,
+        interface: EvaluationInterface,
+    },
+}
+
+#[derive(Clone)]
+enum PendingEvaluation {
+    Evaluate {
+        request: Value,
+        thread_id: i64,
+        stack_level: i64,
+        path: Vec<CalculationPathItem>,
+    },
+    Variables {
+        request: Value,
+        reference: VariableReference,
+    },
+}
+
+impl VariableReference {
+    fn address(&self) -> (i64, i64) {
+        match self {
+            Self::Locals {
+                thread_id,
+                stack_level,
+            }
+            | Self::Value {
+                thread_id,
+                stack_level,
+                ..
+            } => (*thread_id, *stack_level),
+        }
+    }
+
+    fn path(&self) -> Vec<CalculationPathItem> {
+        match self {
+            Self::Locals { .. } => Vec::new(),
+            Self::Value { path, .. } => path.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -370,6 +425,8 @@ impl Adapter {
         self.poll_failed = false;
         self.threads.clear();
         self.call_stacks.clear();
+        self.variable_references.clear();
+        self.pending_evaluations.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
         Ok(())
@@ -670,6 +727,7 @@ impl Adapter {
             ("targetQuit", Some(target_id)) => match self.threads.remove(&target_id) {
                 Some(thread_id) => {
                     self.call_stacks.remove(&thread_id);
+                    self.clear_thread_references(thread_id);
                     vec![event(
                         self.next_sequence(),
                         "thread",
@@ -689,6 +747,7 @@ impl Adapter {
                     debug_event,
                     Some("exception"),
                 ),
+            ("exprEvaluated", _) => self.handle_evaluation_event(debug_event),
             (command_id, _) => {
                 vec![self.output_event("console", format!("1C debug event: {command_id}\\n"))]
             }
@@ -729,6 +788,7 @@ impl Adapter {
         let mut stack = debug_event.call_stack;
         stack.reverse();
         self.call_stacks.insert(thread_id, stack);
+        self.clear_thread_references(thread_id);
         let reason = stopped_reason.unwrap_or(
             if debug_event.stopped_by_breakpoint || debug_event.suspended_by_other {
                 "breakpoint"
@@ -843,9 +903,9 @@ impl Adapter {
                 "no 1C debug session is attached",
             )];
         };
-        let evaluation =
-            match server.evaluate_expression(session, &target_id, stack_level, expression) {
-                Ok(evaluation) => evaluation,
+        let started =
+            match server.begin_evaluate_expression(session, &target_id, stack_level, expression) {
+                Ok(started) => started,
                 Err(error) => {
                     return vec![error_response(
                         request,
@@ -854,16 +914,27 @@ impl Adapter {
                     )];
                 }
             };
-        let result = evaluation.error.unwrap_or(evaluation.value);
-        vec![response(
-            request,
-            self.next_sequence(),
-            json!({
-                "result": result,
-                "type": evaluation.type_name,
-                "variablesReference": 0,
-            }),
-        )]
+        match started.result {
+            Some(evaluation) => self.evaluation_response(
+                request,
+                thread_id,
+                stack_level,
+                vec![CalculationPathItem::Expression(expression.to_owned())],
+                evaluation,
+            ),
+            None => {
+                self.pending_evaluations.insert(
+                    started.result_id,
+                    PendingEvaluation::Evaluate {
+                        request: request.clone(),
+                        thread_id,
+                        stack_level,
+                        path: vec![CalculationPathItem::Expression(expression.to_owned())],
+                    },
+                );
+                Vec::new()
+            }
+        }
     }
 
     fn scopes(&mut self, request: &Value) -> Vec<Value> {
@@ -874,20 +945,24 @@ impl Adapter {
                 "scopes requires frameId",
             )];
         };
-        if self.frame_address(Some(frame_id)).is_none() {
+        let Some((thread_id, stack_level)) = self.frame_address(Some(frame_id)) else {
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 "unknown stack frame",
             )];
-        }
+        };
+        let reference = self.store_variable_reference(VariableReference::Locals {
+            thread_id,
+            stack_level,
+        });
         vec![response(
             request,
             self.next_sequence(),
             json!({
                 "scopes": [{
                     "name": "Локальные",
-                    "variablesReference": frame_id,
+                    "variablesReference": reference,
                     "expensive": false,
                 }],
             }),
@@ -895,17 +970,20 @@ impl Adapter {
     }
 
     fn variables(&mut self, request: &Value) -> Vec<Value> {
-        let (thread_id, stack_level) =
-            match self.frame_address(request["arguments"]["variablesReference"].as_i64()) {
-                Some(address) => address,
-                None => {
-                    return vec![error_response(
-                        request,
-                        self.next_sequence(),
-                        "variablesReference does not identify a current stack frame",
-                    )];
-                }
-            };
+        let reference = match request["arguments"]["variablesReference"]
+            .as_i64()
+            .and_then(|id| self.variable_references.get(&id).cloned())
+        {
+            Some(reference) => reference,
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "variablesReference does not identify a current scope or variable",
+                )];
+            }
+        };
+        let (thread_id, stack_level) = reference.address();
         let target_id = match self.target_id(thread_id) {
             Some(target_id) => target_id.to_owned(),
             None => {
@@ -923,8 +1001,21 @@ impl Adapter {
                 "no 1C debug session is attached",
             )];
         };
-        let variables = match server.evaluate_local_variables(session, &target_id, stack_level) {
-            Ok(variables) => variables,
+        let started = match &reference {
+            VariableReference::Locals { .. } => {
+                server.begin_evaluate_local_variables(session, &target_id, stack_level)
+            }
+            VariableReference::Value {
+                path, interface, ..
+            } => server
+                .begin_evaluate_path(session, &target_id, stack_level, path, *interface)
+                .map(|started| debug_server::EvaluationStart {
+                    result_id: started.result_id,
+                    result: started.result.map(|evaluation| evaluation.variables),
+                }),
+        };
+        let started = match started {
+            Ok(started) => started,
             Err(error) => {
                 return vec![error_response(
                     request,
@@ -933,18 +1024,163 @@ impl Adapter {
                 )];
             }
         };
+        match started.result {
+            Some(variables) => self.variables_response(request, &reference, variables),
+            None => {
+                self.pending_evaluations.insert(
+                    started.result_id,
+                    PendingEvaluation::Variables {
+                        request: request.clone(),
+                        reference,
+                    },
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    fn handle_evaluation_event(&mut self, debug_event: DebugUiEvent) -> Vec<Value> {
+        let Some(evaluation) = debug_event.evaluation else {
+            return vec![self.output_event(
+                "stderr",
+                "1C sent exprEvaluated without calculation data\n".to_owned(),
+            )];
+        };
+        let Some(pending) = self.pending_evaluations.remove(&evaluation.result_id) else {
+            return vec![self.output_event(
+                "console",
+                format!(
+                    "1C sent an unsolicited expression result {}\n",
+                    evaluation.result_id
+                ),
+            )];
+        };
+        match pending {
+            PendingEvaluation::Evaluate {
+                request,
+                thread_id,
+                stack_level,
+                path,
+            } => self.evaluation_response(&request, thread_id, stack_level, path, evaluation),
+            PendingEvaluation::Variables { request, reference } => {
+                self.variables_response(&request, &reference, evaluation.variables)
+            }
+        }
+    }
+
+    fn evaluation_response(
+        &mut self,
+        request: &Value,
+        thread_id: i64,
+        stack_level: i64,
+        path: Vec<CalculationPathItem>,
+        evaluation: DebugEvaluation,
+    ) -> Vec<Value> {
+        let variables_reference = self.value_reference(
+            thread_id,
+            stack_level,
+            path,
+            evaluation.is_expandable,
+            evaluation.is_indexed_collection,
+        );
+        let result = evaluation.error.unwrap_or(evaluation.value);
         vec![response(
             request,
             self.next_sequence(),
             json!({
-                "variables": variables.into_iter().map(|variable| json!({
+                "result": result,
+                "type": evaluation.type_name,
+                "variablesReference": variables_reference,
+            }),
+        )]
+    }
+
+    fn variables_response(
+        &mut self,
+        request: &Value,
+        parent: &VariableReference,
+        variables: Vec<DebugVariable>,
+    ) -> Vec<Value> {
+        let variables = variables
+            .into_iter()
+            .map(|variable| {
+                let (thread_id, stack_level) = parent.address();
+                let mut path = parent.path();
+                match variable.index {
+                    Some(index) => path.push(CalculationPathItem::Index(index)),
+                    None => match parent {
+                        VariableReference::Locals { .. } => {
+                            path.push(CalculationPathItem::Expression(variable.name.clone()))
+                        }
+                        VariableReference::Value { .. } => {
+                            path.push(CalculationPathItem::Property(variable.name.clone()))
+                        }
+                    },
+                }
+                let variables_reference = self.value_reference(
+                    thread_id,
+                    stack_level,
+                    path,
+                    variable.is_expandable,
+                    variable.is_indexed_collection,
+                );
+                json!({
                     "name": variable.name,
                     "type": variable.type_name,
                     "value": variable.value,
-                    "variablesReference": 0,
-                })).collect::<Vec<_>>(),
-            }),
+                    "variablesReference": variables_reference,
+                })
+            })
+            .collect::<Vec<_>>();
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "variables": variables }),
         )]
+    }
+
+    fn value_reference(
+        &mut self,
+        thread_id: i64,
+        stack_level: i64,
+        path: Vec<CalculationPathItem>,
+        is_expandable: bool,
+        is_indexed_collection: bool,
+    ) -> i64 {
+        let interface = if is_expandable {
+            Some(EvaluationInterface::Context)
+        } else if is_indexed_collection {
+            Some(EvaluationInterface::Collection)
+        } else {
+            None
+        };
+        interface.map_or(0, |interface| {
+            self.store_variable_reference(VariableReference::Value {
+                thread_id,
+                stack_level,
+                path,
+                interface,
+            })
+        })
+    }
+
+    fn store_variable_reference(&mut self, reference: VariableReference) -> i64 {
+        self.next_variable_reference = self.next_variable_reference.max(10_000_000) + 1;
+        let identifier = self.next_variable_reference;
+        self.variable_references.insert(identifier, reference);
+        identifier
+    }
+
+    fn clear_thread_references(&mut self, thread_id: i64) {
+        self.variable_references
+            .retain(|_, reference| reference.address().0 != thread_id);
+        self.pending_evaluations.retain(|_, pending| match pending {
+            PendingEvaluation::Evaluate {
+                thread_id: pending_thread,
+                ..
+            } => *pending_thread != thread_id,
+            PendingEvaluation::Variables { reference, .. } => reference.address().0 != thread_id,
+        });
     }
 
     fn frame_address(&self, frame_id: Option<i64>) -> Option<(i64, i64)> {
@@ -1096,8 +1332,82 @@ mod tests {
         assert_eq!(response[0]["body"]["scopes"][0]["name"], "Локальные");
         assert_eq!(
             response[0]["body"]["scopes"][0]["variablesReference"],
-            7_000_001
+            10_000_001
         );
+    }
+
+    #[test]
+    fn completes_deferred_evaluation_when_rdbg_polls_a_result() {
+        let mut adapter = Adapter::default();
+        let request = json!({
+            "seq": 11,
+            "type": "request",
+            "command": "evaluate",
+            "arguments": { "expression": "Counter" },
+        });
+        adapter.pending_evaluations.insert(
+            "result-1".to_owned(),
+            PendingEvaluation::Evaluate {
+                request,
+                thread_id: 7,
+                stack_level: 0,
+                path: vec![CalculationPathItem::Expression("Counter".to_owned())],
+            },
+        );
+
+        let response = adapter.handle_evaluation_event(DebugUiEvent {
+            command_id: "exprEvaluated".to_owned(),
+            evaluation: Some(DebugEvaluation {
+                result_id: "result-1".to_owned(),
+                value: "42".to_owned(),
+                type_name: "Number".to_owned(),
+                ..DebugEvaluation::default()
+            }),
+            ..DebugUiEvent::default()
+        });
+
+        assert_eq!(response[0]["command"], "evaluate");
+        assert!(response[0]["success"].as_bool().unwrap());
+        assert_eq!(response[0]["body"]["result"], "42");
+        assert!(adapter.pending_evaluations.is_empty());
+    }
+
+    #[test]
+    fn assigns_expandable_values_a_calculation_path_reference() {
+        let mut adapter = Adapter::default();
+        let request = json!({
+            "seq": 12,
+            "type": "request",
+            "command": "variables",
+            "arguments": {},
+        });
+        let response = adapter.variables_response(
+            &request,
+            &VariableReference::Locals {
+                thread_id: 7,
+                stack_level: 0,
+            },
+            vec![DebugVariable {
+                name: "Document".to_owned(),
+                type_name: "DocumentObject".to_owned(),
+                value: "Demo".to_owned(),
+                is_expandable: true,
+                ..DebugVariable::default()
+            }],
+        );
+
+        let reference = response[0]["body"]["variables"][0]["variablesReference"]
+            .as_i64()
+            .unwrap();
+        assert!(reference > 10_000_000);
+        assert!(matches!(
+            adapter.variable_references.get(&reference),
+            Some(VariableReference::Value {
+                path,
+                interface: EvaluationInterface::Context,
+                ..
+            }) if path == &vec![CalculationPathItem::Expression("Document".to_owned())]
+        ));
     }
 
     #[test]
