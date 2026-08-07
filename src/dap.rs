@@ -43,7 +43,12 @@ impl<R: Read> Reader<R> {
                 .split_once(':')
                 .context("invalid DAP header (expected `Name: value`)")?;
             if name.eq_ignore_ascii_case("Content-Length") {
-                content_length = Some(value.trim().parse::<usize>().context("invalid Content-Length")?);
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .context("invalid Content-Length")?,
+                );
             }
         }
 

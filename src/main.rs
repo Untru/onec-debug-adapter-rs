@@ -46,10 +46,18 @@ impl Adapter {
                     response(request, self.next_sequence(), json!({})),
                     event(self.next_sequence(), "initialized", json!({})),
                 ],
-                Err(error) => vec![error_response(request, self.next_sequence(), error.to_string())],
+                Err(error) => vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )],
             },
             "configurationDone" => vec![response(request, self.next_sequence(), json!({}))],
-            "threads" => vec![response(request, self.next_sequence(), json!({ "threads": [] }))],
+            "threads" => vec![response(
+                request,
+                self.next_sequence(),
+                json!({ "threads": [] }),
+            )],
             "disconnect" | "terminate" => {
                 self.debug_server = None;
                 vec![response(request, self.next_sequence(), json!({}))]
@@ -66,8 +74,9 @@ impl Adapter {
         if self.debug_server.is_some() {
             anyhow::bail!("a 1C debug server is already attached");
         }
-        let arguments: ConnectionArguments = serde_json::from_value(request["arguments"].clone())
-            .context("launch/attach requires debugServerHost and debugServerPort")?;
+        let arguments: ConnectionArguments =
+            serde_json::from_value(request["arguments"].clone())
+                .context("launch/attach requires debugServerHost and debugServerPort")?;
         let server = DebugServer::new(&arguments.debug_server_host, arguments.debug_server_port)?;
         server.test_connection()?;
         eprintln!("connected to 1C debug server: {}", server.endpoint());
