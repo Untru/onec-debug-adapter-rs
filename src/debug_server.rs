@@ -208,6 +208,9 @@ fn xml_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn attach_request_contains_escaped_base_request_data() {
@@ -242,5 +245,64 @@ mod tests {
             AttachDebugUiResult::IbInDebug
         );
         assert!(AttachDebugUiResult::parse("unexpected").is_err());
+    }
+
+    #[test]
+    fn attaches_and_detaches_using_the_rdbg_http_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_thread = thread::spawn(move || {
+            let responses = [
+                "",
+                "<response><result>registered</result></response>",
+                "<response><result>true</result></response>",
+            ];
+            let mut requests = Vec::new();
+
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut content_length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = header.split_once(':') {
+                        if name.eq_ignore_ascii_case("Content-Length") {
+                            content_length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                let mut body = vec![0; content_length];
+                reader.read_exact(&mut body).unwrap();
+                requests.push(format!("{request_line}{}", String::from_utf8(body).unwrap()));
+
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response.len(),
+                    response
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+            requests
+        });
+
+        let server = DebugServer::new("127.0.0.1", port).unwrap();
+        let session = server.attach_debug_ui("DemoBase").unwrap();
+        server.detach_debug_ui(&session).unwrap();
+        let requests = server_thread.join().unwrap();
+
+        assert!(requests[0].starts_with("POST /e1crdbg/rdbgTest?cmd=test HTTP/1.1"));
+        assert!(requests[1].starts_with("POST /e1crdbg/rdbg?cmd=attachDebugUI HTTP/1.1"));
+        assert!(requests[1].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
+        assert!(requests[1].contains("<foregroundAbility>true</foregroundAbility>"));
+        assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[2].contains(&format!("<idOfDebuggerUI>{}</idOfDebuggerUI>", session.id())));
     }
 }
