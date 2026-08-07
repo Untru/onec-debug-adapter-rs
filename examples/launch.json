@@ -8,6 +8,21 @@
       "infoBase": "MyInfoBase",
       "debugServerHost": "localhost",
       "debugServerPort": 1550
+    },
+    {
+      "name": "1C: Launch native client",
+      "type": "onec",
+      "request": "launch",
+      "rootProject": "/absolute/path/to/unpacked-configuration",
+      "platformPath": "/absolute/path/to/1c-platform-versions",
+      "platformVersion": "LATEST",
+      "infoBase": "MyInfoBase",
+      "debugServerHost": "localhost",
+      "debugServerPort": 1550,
+      "autoAttachTypes": [
+        "ManagedClient",
+        "Server"
+      ]
     }
   ]
 }
