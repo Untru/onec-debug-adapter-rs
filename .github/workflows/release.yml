@@ -24,7 +24,7 @@ jobs:
           - os: windows-2025
             rid: win32-x64
             binary: onec-debug-adapter.exe
-          - os: macos-13
+          - os: macos-15-intel
             rid: darwin-x64
             binary: onec-debug-adapter
           - os: macos-14
