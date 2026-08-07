@@ -1,0 +1,166 @@
+{
+  "name": "onec-debug-native",
+  "displayName": "1C:Enterprise Native Debugger",
+  "description": "Native cross-platform Debug Adapter Protocol integration for 1C:Enterprise",
+  "version": "0.1.0",
+  "publisher": "untru",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Untru/onec-debug-adapter-rs.git"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Debuggers"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onDebug:onec"
+  ],
+  "contributes": {
+    "configuration": {
+      "title": "1C:Enterprise Native Debugger",
+      "properties": {
+        "onec.nativeAdapterPath": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "description": "Absolute path to a native onec-debug-adapter binary. Leave empty to use the binary bundled with the extension."
+        }
+      }
+    },
+    "breakpoints": [
+      {
+        "language": "bsl"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "onec",
+        "label": "1C:Enterprise",
+        "languages": [
+          "bsl"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "rootProject",
+              "platformPath",
+              "infoBase"
+            ],
+            "properties": {
+              "rootProject": {
+                "type": "string",
+                "description": "Directory containing the unpacked 1C configuration"
+              },
+              "platformPath": {
+                "type": "string",
+                "description": "Directory containing installed 1C platform versions"
+              },
+              "platformVersion": {
+                "type": "string",
+                "description": "1C platform version, or LATEST"
+              },
+              "infoBase": {
+                "type": "string",
+                "description": "1C infobase name or alias"
+              },
+              "infoBaseAlias": {
+                "type": "string",
+                "description": "Explicit server-side infobase alias; takes precedence over infoBase"
+              },
+              "debugServerHost": {
+                "type": "string",
+                "default": "localhost",
+                "description": "1C debug server host"
+              },
+              "debugServerPort": {
+                "type": "number",
+                "default": 1550,
+                "description": "1C debug server port"
+              },
+              "extensions": {
+                "type": "array",
+                "description": "Directories of configuration extensions"
+              },
+              "autoAttachTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "Client",
+                    "ManagedClient",
+                    "WebClient",
+                    "ComConnector",
+                    "Server",
+                    "ServerEmulation",
+                    "WebService",
+                    "HttpService",
+                    "OData",
+                    "Job",
+                    "JobFileMode",
+                    "MobileClient",
+                    "MobileServer",
+                    "MobileJobFileMode",
+                    "MobileManagedClient",
+                    "MobileManagedServer"
+                  ]
+                }
+              }
+            }
+          },
+          "attach": {
+            "required": [
+              "rootProject",
+              "infoBase"
+            ],
+            "properties": {
+              "rootProject": {
+                "type": "string",
+                "description": "Directory containing the unpacked 1C configuration"
+              },
+              "platformPath": {
+                "type": "string",
+                "description": "Directory containing installed 1C platform versions"
+              },
+              "platformVersion": {
+                "type": "string",
+                "description": "1C platform version, or LATEST"
+              },
+              "infoBase": {
+                "type": "string",
+                "description": "1C infobase name or alias"
+              },
+              "infoBaseAlias": {
+                "type": "string",
+                "description": "Explicit server-side infobase alias; takes precedence over infoBase"
+              },
+              "debugServerHost": {
+                "type": "string",
+                "default": "localhost",
+                "description": "1C debug server host"
+              },
+              "debugServerPort": {
+                "type": "number",
+                "default": 1550,
+                "description": "1C debug server port"
+              },
+              "extensions": {
+                "type": "array",
+                "description": "Directories of configuration extensions"
+              },
+              "autoAttachTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    ]
+  }
+}

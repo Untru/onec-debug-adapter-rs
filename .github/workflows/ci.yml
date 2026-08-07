@@ -15,6 +15,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+      - run: node --check extension.js
+        working-directory: vscode-extension
+      - run: npx --yes @vscode/vsce@3.9.2 package --no-dependencies --out /tmp/onec-debug-native.vsix
+        working-directory: vscode-extension
