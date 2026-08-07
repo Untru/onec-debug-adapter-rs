@@ -1,0 +1,66 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    name: Package ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rid: linux-x64
+            binary: onec-debug-adapter
+          - os: windows-2025
+            rid: win32-x64
+            binary: onec-debug-adapter.exe
+          - os: macos-13
+            rid: darwin-x64
+            binary: onec-debug-adapter
+          - os: macos-14
+            rid: darwin-arm64
+            binary: onec-debug-adapter
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build --locked --release
+      - name: Bundle native adapter
+        shell: bash
+        run: |
+          mkdir -p "vscode-extension/bin/${{ matrix.rid }}"
+          cp "target/release/${{ matrix.binary }}" "vscode-extension/bin/${{ matrix.rid }}/${{ matrix.binary }}"
+      - name: Package VSIX
+        working-directory: vscode-extension
+        run: npx --yes @vscode/vsce@3.9.2 package --no-dependencies --out "../onec-debug-native-${{ matrix.rid }}.vsix"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: onec-debug-native-${{ matrix.rid }}
+          path: onec-debug-native-${{ matrix.rid }}.vsix
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum *.vsix > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/*

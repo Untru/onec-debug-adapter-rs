@@ -25,6 +25,8 @@ cargo build --release
 
 Получившийся файл: `target/release/onec-debug-adapter` (`.exe` в Windows). Пример конфигурации находится в [`examples/launch.json`](examples/launch.json).
 
+При публикации тега `v*` GitHub Actions собирает нативные VSIX для Windows x64, Linux x64, macOS x64 и macOS Apple Silicon. В каждом VSIX находится только подходящий бинарник адаптера; устанавливать .NET, Rust или Node.js пользователю не нужно.
+
 ## Совместимость с VS Code
 
 Готовящееся расширение будет регистрировать тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому существующие `launch.json` сохранят `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; менять нужно будет только установленное расширение. Вместо `dotnet` оно запустит подходящий для ОС нативный бинарник из VSIX.
