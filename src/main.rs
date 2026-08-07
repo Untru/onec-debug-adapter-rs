@@ -16,16 +16,17 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, stderr};
 use std::path::PathBuf;
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct Adapter {
     next_sequence: u64,
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
+    file_debug_server: Option<Child>,
     debuggee: Option<Child>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
@@ -91,7 +92,9 @@ impl VariableReference {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionArguments {
+    #[serde(default = "default_debug_server_host")]
     debug_server_host: String,
+    #[serde(default = "default_debug_server_port")]
     debug_server_port: u16,
     info_base: Option<String>,
     info_base_alias: Option<String>,
@@ -100,6 +103,25 @@ struct ConnectionArguments {
     platform_version: Option<String>,
     extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InfoBaseTarget {
+    alias: String,
+    is_file: bool,
+}
+
+struct SpawnedDebugServer {
+    server: DebugServer,
+    child: Child,
+}
+
+fn default_debug_server_host() -> String {
+    "localhost".to_owned()
+}
+
+fn default_debug_server_port() -> u16 {
+    1550
 }
 
 fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Result<Child> {
@@ -141,6 +163,95 @@ fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Res
         ])
         .spawn()
         .with_context(|| format!("cannot start 1C client {}", executable.display()))
+}
+
+/// Starts the 1C RDBG sidecar used by a file infobase and waits until it
+/// publishes its selected port. Server infobases have a persistent RDBG
+/// service, but a file infobase needs this process for each debug session.
+fn launch_file_debug_server(platform_bin: &PathBuf, host: &str) -> Result<SpawnedDebugServer> {
+    let executable = platform_bin.join(if cfg!(windows) { "dbgs.exe" } else { "dbgs" });
+    if !executable.is_file() {
+        anyhow::bail!(
+            "1C debug server executable was not found at {}",
+            executable.display()
+        );
+    }
+
+    let notify_path = std::env::temp_dir().join(format!(
+        "onec-debug-adapter-{}.notify",
+        uuid::Uuid::new_v4()
+    ));
+    let mut child = Command::new(&executable)
+        .args([
+            format!("--addr={host}"),
+            "--portRange=1550:1559".to_owned(),
+            format!("--ownerPID={}", std::process::id()),
+            format!("--notify={}", notify_path.display()),
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("cannot start 1C debug server {}", executable.display()))?;
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let port = loop {
+        match fs::read_to_string(&notify_path) {
+            Ok(notification) => match debug_server_port_from_notification(&notification) {
+                Ok(port) => break port,
+                Err(error) => {
+                    terminate_child(&mut child);
+                    let _ = fs::remove_file(&notify_path);
+                    return Err(error);
+                }
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = fs::remove_file(&notify_path);
+                return Err(error).context("cannot read 1C debug server notification");
+            }
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("cannot check 1C debug server status")?
+        {
+            let _ = fs::remove_file(&notify_path);
+            anyhow::bail!("1C debug server exited before it reported a port: {status}");
+        }
+        if Instant::now() >= deadline {
+            terminate_child(&mut child);
+            let _ = fs::remove_file(&notify_path);
+            anyhow::bail!("timed out waiting for 1C debug server to report its port");
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    let _ = fs::remove_file(&notify_path);
+    Ok(SpawnedDebugServer {
+        server: DebugServer::new(host, port)?,
+        child,
+    })
+}
+
+fn debug_server_port_from_notification(notification: &str) -> Result<u16> {
+    let (_, port) = notification
+        .trim()
+        .rsplit_once(':')
+        .context("1C debug server notification does not contain a port")?;
+    let port = port
+        .parse::<u16>()
+        .context("1C debug server notification contains an invalid port")?;
+    if port == 0 {
+        anyhow::bail!("1C debug server notification contains port 0");
+    }
+    Ok(port)
+}
+
+fn terminate_child(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 fn platform_bin(platform_path: &PathBuf, requested_version: Option<&str>) -> Result<PathBuf> {
@@ -189,26 +300,28 @@ fn version_key(version: &str) -> Vec<u32> {
         .collect()
 }
 
-fn info_base_alias(arguments: &ConnectionArguments) -> Result<String> {
-    if let Some(alias) = arguments
-        .info_base_alias
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(alias.to_owned());
-    }
+fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
     let info_base = arguments
         .info_base
         .as_deref()
+        .or(arguments.info_base_alias.as_deref())
         .context("launch/attach requires infoBase or infoBaseAlias")?;
-    for path in ibases_paths() {
-        if let Ok(contents) = fs::read_to_string(path) {
-            if let Some(alias) = launcher_alias(&contents, info_base) {
-                return Ok(alias);
-            }
-        }
-    }
-    Ok(info_base.to_owned())
+    let launcher_target = ibases_paths().into_iter().find_map(|path| {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| launcher_info_base(&contents, info_base))
+    });
+    let alias = arguments
+        .info_base_alias
+        .as_deref()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| launcher_target.as_ref().map(|target| target.alias.clone()))
+        .unwrap_or_else(|| info_base.to_owned());
+    Ok(InfoBaseTarget {
+        alias,
+        is_file: launcher_target.is_some_and(|target| target.is_file),
+    })
 }
 
 fn ibases_paths() -> Vec<PathBuf> {
@@ -243,7 +356,7 @@ fn ibases_paths() -> Vec<PathBuf> {
     paths
 }
 
-fn launcher_alias(ibases: &str, info_base_name: &str) -> Option<String> {
+fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarget> {
     let mut selected = false;
     for raw_line in ibases.lines() {
         let line = raw_line.trim();
@@ -257,19 +370,32 @@ fn launcher_alias(ibases: &str, info_base_name: &str) -> Option<String> {
         if !selected {
             continue;
         }
-        let Some(connect) = line.strip_prefix("Connect=") else {
+        let Some((key, connect)) = line.split_once('=') else {
             continue;
         };
+        if !key.trim().eq_ignore_ascii_case("Connect") {
+            continue;
+        }
         if connect
             .trim_start()
             .to_ascii_lowercase()
             .starts_with("file=")
         {
-            return Some("DefAlias".to_owned());
+            return Some(InfoBaseTarget {
+                alias: "DefAlias".to_owned(),
+                is_file: true,
+            });
         }
-        return extract_connection_property(connect, "Ref");
+        return extract_connection_property(connect, "Ref").map(|alias| InfoBaseTarget {
+            alias,
+            is_file: false,
+        });
     }
     None
+}
+
+fn launcher_alias(ibases: &str, info_base_name: &str) -> Option<String> {
+    launcher_info_base(ibases, info_base_name).map(|target| target.alias)
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -365,7 +491,6 @@ impl Adapter {
         let arguments: ConnectionArguments =
             serde_json::from_value(request["arguments"].clone())
                 .context("launch/attach requires debugServerHost and debugServerPort")?;
-        let server = DebugServer::new(&arguments.debug_server_host, arguments.debug_server_port)?;
         let module_registry = match arguments.root_project.as_deref() {
             Some(root_project) => {
                 let extensions = arguments
@@ -382,16 +507,56 @@ impl Adapter {
             }
             None => None,
         };
-        let info_base_alias = info_base_alias(&arguments)?;
-        let session = server.attach_debug_ui(&info_base_alias)?;
+        let info_base = info_base_target(&arguments)?;
+        let mut spawned_debug_server = if launch && info_base.is_file {
+            let platform_path = arguments
+                .platform_path
+                .as_deref()
+                .context("launch requires platformPath for a file infobase")?;
+            let platform_bin = platform_bin(
+                &PathBuf::from(platform_path),
+                arguments.platform_version.as_deref(),
+            )?;
+            Some(launch_file_debug_server(
+                &platform_bin,
+                &arguments.debug_server_host,
+            )?)
+        } else {
+            None
+        };
+        let server = spawned_debug_server
+            .as_ref()
+            .map(|spawned| spawned.server.clone())
+            .unwrap_or(DebugServer::new(
+                &arguments.debug_server_host,
+                arguments.debug_server_port,
+            )?);
+        let session = match server.attach_debug_ui(&info_base.alias) {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(spawned) = &mut spawned_debug_server {
+                    terminate_child(&mut spawned.child);
+                }
+                return Err(error);
+            }
+        };
         if let Some(types) = &arguments.auto_attach_types {
-            server.set_auto_attach_types(&session, types)?;
+            if let Err(error) = server.set_auto_attach_types(&session, types) {
+                let _ = server.detach_debug_ui(&session);
+                if let Some(spawned) = &mut spawned_debug_server {
+                    terminate_child(&mut spawned.child);
+                }
+                return Err(error);
+            }
         }
         let debuggee = if launch {
             match launch_debuggee(&arguments, &server) {
                 Ok(debuggee) => Some(debuggee),
                 Err(error) => {
                     let _ = server.detach_debug_ui(&session);
+                    if let Some(spawned) = &mut spawned_debug_server {
+                        terminate_child(&mut spawned.child);
+                    }
                     return Err(error);
                 }
             }
@@ -405,6 +570,7 @@ impl Adapter {
         );
         self.debug_server = Some(server);
         self.debug_session = Some(session);
+        self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
         self.debuggee = debuggee;
         self.poll_failed = false;
         self.module_registry = module_registry;
@@ -413,14 +579,17 @@ impl Adapter {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        if let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) {
-            server.detach_debug_ui(session)?;
-        }
+        let detach_result = match (&self.debug_server, &self.debug_session) {
+            (Some(server), Some(session)) => server.detach_debug_ui(session),
+            _ => Ok(()),
+        };
         self.debug_session = None;
         self.debug_server = None;
+        if let Some(mut debug_server) = self.file_debug_server.take() {
+            terminate_child(&mut debug_server);
+        }
         if let Some(mut debuggee) = self.debuggee.take() {
-            let _ = debuggee.kill();
-            let _ = debuggee.wait();
+            terminate_child(&mut debuggee);
         }
         self.poll_failed = false;
         self.threads.clear();
@@ -429,7 +598,7 @@ impl Adapter {
         self.pending_evaluations.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
-        Ok(())
+        detach_result
     }
 
     fn step(&mut self, request: &Value, action: StepAction) -> Vec<Value> {
@@ -645,6 +814,26 @@ impl Adapter {
     }
 
     fn poll(&mut self) -> Vec<Value> {
+        let file_debug_server_status = self
+            .file_debug_server
+            .as_mut()
+            .and_then(|debug_server| debug_server.try_wait().ok().flatten());
+        if let Some(status) = file_debug_server_status {
+            self.file_debug_server = None;
+            let detach_error = self.disconnect().err();
+            let mut messages = vec![self.output_event(
+                "stderr",
+                format!("1C debug server exited unexpectedly: {status}\n"),
+            )];
+            if let Some(error) = detach_error {
+                messages.push(self.output_event(
+                    "stderr",
+                    format!("cannot detach 1C Debug UI after debug server exit: {error}\n"),
+                ));
+            }
+            messages.push(event(self.next_sequence(), "terminated", json!({})));
+            return messages;
+        }
         let debuggee_status = self
             .debuggee
             .as_mut()
@@ -1454,5 +1643,63 @@ Connect=File="/tmp/demo";
             Some("DefAlias".to_owned())
         );
         assert_eq!(launcher_alias(ibases, "Missing"), None);
+        assert_eq!(
+            launcher_info_base(ibases, "FileDemo"),
+            Some(InfoBaseTarget {
+                alias: "DefAlias".to_owned(),
+                is_file: true,
+            })
+        );
+        assert_eq!(
+            launcher_info_base(ibases, "Demo"),
+            Some(InfoBaseTarget {
+                alias: "Accounting".to_owned(),
+                is_file: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_a_port_published_by_dbgs() {
+        assert_eq!(
+            debug_server_port_from_notification("localhost:1556\n").unwrap(),
+            1556
+        );
+        assert_eq!(
+            debug_server_port_from_notification("[::1]:1557").unwrap(),
+            1557
+        );
+        assert!(debug_server_port_from_notification("no-port").is_err());
+        assert!(debug_server_port_from_notification("localhost:0").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn starts_file_infobase_debug_server_and_uses_its_published_port() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!("onec-dbgs-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let executable = root.join("dbgs");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+for argument in "$@"; do
+    case "$argument" in
+        --notify=*) notify="${argument#--notify=}" ;;
+    esac
+done
+printf '127.0.0.1:1556' > "$notify"
+while true; do sleep 1; done
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut spawned = launch_file_debug_server(&root, "127.0.0.1").unwrap();
+        assert_eq!(spawned.server.endpoint(), "http://127.0.0.1:1556/e1crdbg");
+        assert!(spawned.child.try_wait().unwrap().is_none());
+        terminate_child(&mut spawned.child);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -11,7 +11,7 @@
 - DAP `launch`, `attach`, breakpoints, exception breakpoints, stepping, pause, threads и disconnect;
 - source/condition/hit-count/logpoint для BSL-модулей основной конфигурации и расширений;
 - событие остановки, stack trace, раскрываемые локальные variables и evaluate/hover, включая отложенный RDBG `exprEvaluated`;
-- `launch` выбирает `1cv8c` из `platformPath` (указанная версия или `LATEST`) и запускает его с HTTP-отладкой;
+- `launch` выбирает `1cv8c` из `platformPath` (указанная версия или `LATEST`) и запускает его с HTTP-отладкой; для файловой базы сам поднимает и затем останавливает `dbgs`, используя выделенный им порт;
 - CI проверяет форматирование, Clippy, unit-тесты и упаковку VSIX.
 
 `attach` предназначен для уже доступного сервера отладки 1С. Для `launch` платформа 1С должна быть установлена у пользователя, но Rust, .NET, Node.js и права администратора для адаптера не нужны.
@@ -26,7 +26,7 @@ cargo build --release
 
 Получившийся файл: `target/release/onec-debug-adapter` (`.exe` в Windows). Пример конфигурации находится в [`examples/launch.json`](examples/launch.json).
 
-При публикации тега `v*` GitHub Actions собирает нативные VSIX для Windows x64, Linux x64, macOS x64 и macOS Apple Silicon. В каждом VSIX находится только подходящий бинарник адаптера; устанавливать .NET, Rust или Node.js пользователю не нужно.
+При публикации тега `v*` GitHub Actions собирает нативные VSIX для Windows x64, Linux x64/ARM64 и macOS x64/Apple Silicon. В каждом VSIX находится только подходящий бинарник адаптера; устанавливать .NET, Rust или Node.js пользователю не нужно.
 
 ## Совместимость с VS Code
 
