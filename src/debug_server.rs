@@ -485,7 +485,12 @@ fn auto_attach_settings_request(session: &DebugUiSession, types: &[String]) -> S
 fn debug_target_request(session: &DebugUiSession, attach: bool, target_ids: &[String]) -> String {
     let targets = target_ids
         .iter()
-        .map(|target_id| format!("<id><id>{}</id></id>", xml_escape(target_id)))
+        .map(|target_id| {
+            format!(
+                "<id><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">{}</id></id>",
+                xml_escape(target_id)
+            )
+        })
         .collect::<String>();
     let base = base_request(session);
     base.replacen(
@@ -1464,7 +1469,9 @@ mod tests {
             session.id()
         )));
         assert!(requests[6].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
-        assert!(requests[6].contains("<attach>true</attach><id><id>target-1</id></id>"));
+        assert!(requests[6].contains(&format!(
+            "<attach>true</attach><id><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">target-1</id></id>"
+        )));
         assert!(requests[7].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
         assert!(requests[7].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
