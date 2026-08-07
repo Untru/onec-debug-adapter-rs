@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "1C: Attach to debug server",
-      "type": "onec-rs",
+      "type": "onec",
       "request": "attach",
       "debugServerHost": "localhost",
       "debugServerPort": 1550

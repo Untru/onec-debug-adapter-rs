@@ -110,8 +110,9 @@ mod tests {
 
     #[test]
     fn frames_round_trip() {
-        let source = b"Content-Length: 17\r\n\r\n{\"command\":\"test\"}";
-        let received = Reader::new(&source[..]).read().unwrap().unwrap();
+        let payload = r#"{"command":"test"}"#;
+        let source = format!("Content-Length: {}\r\n\r\n{payload}", payload.len());
+        let received = Reader::new(source.as_bytes()).read().unwrap().unwrap();
         assert_eq!(received.0["command"], "test");
 
         let mut bytes = Vec::new();

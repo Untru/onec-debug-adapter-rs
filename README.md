@@ -25,6 +25,10 @@ cargo build --release
 
 Получившийся файл: `target/release/onec-debug-adapter` (`.exe` в Windows). Пример конфигурации находится в [`examples/launch.json`](examples/launch.json).
 
+## Совместимость с VS Code
+
+Готовящееся расширение будет регистрировать тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому существующие `launch.json` сохранят `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; менять нужно будет только установленное расширение. Вместо `dotnet` оно запустит подходящий для ОС нативный бинарник из VSIX.
+
 `attach` работает с сервером отладки на другой машине. Для режима `launch` в будущих версиях локально должна быть установлена платформа 1С соответствующей ОС.
 
 [dap]: https://microsoft.github.io/debug-adapter-protocol/
