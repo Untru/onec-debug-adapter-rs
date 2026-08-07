@@ -36,6 +36,41 @@
         "language": "bsl"
       }
     ],
+    "views": {
+      "debug": [
+        {
+          "id": "debug.debugTargets",
+          "name": "Цели отладки",
+          "when": "debugState != inactive"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "debug.debugTargets.connect",
+        "title": "Подключить к цели отладки"
+      },
+      {
+        "command": "debug.debugTargets.refresh",
+        "title": "Обновить цели отладки"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "debug.debugTargets.refresh",
+          "when": "view == debug.debugTargets",
+          "group": "navigation"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "debug.debugTargets.connect",
+          "when": "view == debug.debugTargets && viewItem == onecDebugTarget",
+          "group": "inline"
+        }
+      ]
+    },
     "debuggers": [
       {
         "type": "onec",

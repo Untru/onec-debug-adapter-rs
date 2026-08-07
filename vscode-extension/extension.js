@@ -35,6 +35,61 @@ function configuredAutoAttachTypes(session) {
     : [];
 }
 
+class DebugTargetsProvider {
+  constructor() {
+    this.items = [];
+    this.changeEmitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this.changeEmitter.event;
+  }
+
+  update(items) {
+    this.items = Array.isArray(items)
+      ? items.filter((item) => item && typeof (item.Id ?? item.id) === "string")
+      : [];
+    this.changeEmitter.fire();
+  }
+
+  getTreeItem(target) {
+    const id = target.Id ?? target.id;
+    const type = target.Type ?? target.type ?? "Неизвестный тип";
+    const user = target.User ?? target.user ?? "Неизвестный пользователь";
+    const seance = target.Seance ?? target.seance ?? "";
+    const item = new vscode.TreeItem(
+      `${type} (${user}${seance ? `, ${seance}` : ""})`,
+      vscode.TreeItemCollapsibleState.None
+    );
+    item.id = id;
+    item.contextValue = "onecDebugTarget";
+    item.command = {
+      command: "debug.debugTargets.connect",
+      title: "Подключить",
+      arguments: [target]
+    };
+    return item;
+  }
+
+  getChildren(element) {
+    return element ? [] : this.items;
+  }
+}
+
+const debugTargetsProvider = new DebugTargetsProvider();
+
+function activeOnecDebugSession() {
+  const session = vscode.debug.activeDebugSession;
+  return session?.type === "onec" ? session : undefined;
+}
+
+function updateDebugTargets(session) {
+  if (session?.type !== "onec") {
+    return Promise.resolve();
+  }
+  return session
+    .customRequest("DebugTargetsRequest")
+    .then((targets) => debugTargetsProvider.update(targets?.Items ?? targets?.items))
+    .catch(() => undefined);
+}
+
 function activate(context) {
   const factory = {
     createDebugAdapterDescriptor() {
@@ -51,6 +106,49 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.debug.registerDebugAdapterDescriptorFactory("onec", factory)
+  );
+  context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("debug.debugTargets", debugTargetsProvider)
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("debug.debugTargets.refresh", () =>
+      updateDebugTargets(activeOnecDebugSession())
+    )
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("debug.debugTargets.connect", (target) => {
+      const id = target?.Id ?? target?.id;
+      const session = activeOnecDebugSession();
+      if (typeof id !== "string" || !session) {
+        return undefined;
+      }
+      return session
+        .customRequest("AttachDebugTargetRequest", { Id: id })
+        .then(() => updateDebugTargets(session))
+        .catch(() => undefined);
+    })
+  );
+  context.subscriptions.push(
+    vscode.debug.onDidStartDebugSession((session) => {
+      updateDebugTargets(session);
+    })
+  );
+  context.subscriptions.push(
+    vscode.debug.onDidTerminateDebugSession((session) => {
+      if (session.type === "onec") {
+        debugTargetsProvider.update([]);
+      }
+    })
+  );
+  context.subscriptions.push(
+    vscode.debug.onDidReceiveDebugSessionCustomEvent((debugEvent) => {
+      if (
+        debugEvent.session.type === "onec" &&
+        debugEvent.event === "DebugTargetsUpdated"
+      ) {
+        updateDebugTargets(debugEvent.session);
+      }
+    })
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((event) => {
@@ -77,5 +175,8 @@ module.exports = {
   adapterPath,
   bundledAdapterPath,
   configuredAutoAttachTypes,
+  DebugTargetsProvider,
+  debugTargetsProvider,
+  updateDebugTargets,
   platformBinaryName
 };

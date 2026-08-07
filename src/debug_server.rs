@@ -33,6 +33,18 @@ pub struct DebugUiEvent {
     pub evaluation: Option<DebugEvaluation>,
 }
 
+/// A debuggable 1C execution context returned by `getDbgTargets`.
+///
+/// The identifier is stable for the lifetime of the context and is the value
+/// accepted by `attachDetachDbgTargets`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DebugTarget {
+    pub id: String,
+    pub seance_no: String,
+    pub user_name: String,
+    pub target_type: String,
+}
+
 /// One call-stack item sent by RDBG as part of a `callStackFormed` event.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DebugStackFrame {
@@ -260,6 +272,12 @@ impl DebugServer {
         }
         let body = auto_attach_settings_request(session, types);
         self.post_xml("setAutoAttachSettings", &body).map(|_| ())
+    }
+
+    /// Lists execution contexts that can be manually attached from VS Code.
+    pub fn get_debug_targets(&self, session: &DebugUiSession) -> Result<Vec<DebugTarget>> {
+        let response = self.post_xml("getDbgTargets", &base_request(session))?;
+        parse_debug_targets(&response)
     }
 
     /// Fetches pending Debug UI commands. The caller is responsible for
@@ -798,6 +816,55 @@ fn response_element(xml: &str, expected_element: &str) -> Result<String> {
     }
 }
 
+fn parse_debug_targets(xml: &str) -> Result<Vec<DebugTarget>> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+    let mut names = Vec::<String>::new();
+    let mut current = None::<DebugTarget>;
+    let mut targets = Vec::new();
+
+    loop {
+        match reader.read_event()? {
+            Event::Start(element) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                // RDBGSGetDbgTargetsResponse is a flat `<response><id>…`
+                // collection. Its inner `id` is the target UUID.
+                if name == "id" && names.len() == 1 && names[0] == "response" {
+                    current = Some(DebugTarget::default());
+                }
+                names.push(name);
+            }
+            Event::End(element) => {
+                let name = String::from_utf8_lossy(element.local_name().as_ref()).into_owned();
+                if name == "id" && names.len() == 2 && names[0] == "response" {
+                    if let Some(target) = current.take().filter(|target| !target.id.is_empty()) {
+                        targets.push(target);
+                    }
+                }
+                names.pop();
+            }
+            Event::Text(text) => {
+                let Some(target) = &mut current else {
+                    continue;
+                };
+                let value = text
+                    .unescape()
+                    .map(|value| value.into_owned())
+                    .context("cannot decode debug targets response")?;
+                match names.last().map(String::as_str) {
+                    Some("id") if names.len() == 3 => target.id = value,
+                    Some("seanceNo") => target.seance_no = value,
+                    Some("userName") => target.user_name = value,
+                    Some("targetType") => target.target_type = value,
+                    _ => {}
+                }
+            }
+            Event::Eof => return Ok(targets),
+            _ => {}
+        }
+    }
+}
+
 fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
     let mut reader = Reader::from_str(xml);
     reader.config_mut().trim_text(true);
@@ -1030,6 +1097,32 @@ mod tests {
     }
 
     #[test]
+    fn parses_debug_targets_returned_by_rdbg() {
+        let targets = parse_debug_targets(
+            "<response xmlns=\"http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse\"><id><id>target-1</id><seanceNo>17</seanceNo><userName>Администратор</userName><targetType>ManagedClient</targetType></id><id><id>target-2</id><seanceNo>18</seanceNo><userName></userName><targetType>HTTPService</targetType></id></response>",
+        )
+        .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![
+                DebugTarget {
+                    id: "target-1".to_owned(),
+                    seance_no: "17".to_owned(),
+                    user_name: "Администратор".to_owned(),
+                    target_type: "ManagedClient".to_owned(),
+                },
+                DebugTarget {
+                    id: "target-2".to_owned(),
+                    seance_no: "18".to_owned(),
+                    user_name: String::new(),
+                    target_type: "HTTPService".to_owned(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn parses_target_lifecycle_events() {
         let events = parse_debug_ui_events(
             "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result><result><cmdID>targetQuit</cmdID><targetID><id>target-1</id></targetID></result></response>",
@@ -1255,6 +1348,7 @@ mod tests {
                 "",
                 "<response><result>registered</result></response>",
                 "<response></response>",
+                "<response><id><id>target-1</id><seanceNo>1</seanceNo><userName>Demo</userName><targetType>Client</targetType></id></response>",
                 "<response><result><cmdID>targetStarted</cmdID><targetID><id>target-1</id></targetID></result></response>",
                 "<response></response>",
                 "<response></response>",
@@ -1305,6 +1399,15 @@ mod tests {
             .set_auto_attach_types(&session, &["Client".to_owned(), "HttpService".to_owned()])
             .unwrap();
         assert_eq!(
+            server.get_debug_targets(&session).unwrap(),
+            vec![DebugTarget {
+                id: "target-1".to_owned(),
+                seance_no: "1".to_owned(),
+                user_name: "Demo".to_owned(),
+                target_type: "Client".to_owned(),
+            }]
+        );
+        assert_eq!(
             server.ping_debug_ui(&session).unwrap(),
             vec![DebugUiEvent {
                 command_id: "targetStarted".to_owned(),
@@ -1326,18 +1429,20 @@ mod tests {
         assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=setAutoAttachSettings HTTP/1.1"));
         assert!(requests[2].contains("<targetType>Client</targetType>"));
         assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
-        assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
+        assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=getDbgTargets HTTP/1.1"));
+        assert!(requests[3].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
+        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
         assert!(
-            requests[4].starts_with("POST /e1crdbg/rdbg?cmd=clearBreakOnNextStatement HTTP/1.1")
+            requests[5].starts_with("POST /e1crdbg/rdbg?cmd=clearBreakOnNextStatement HTTP/1.1")
         );
-        assert!(requests[4].contains(&format!(
+        assert!(requests[5].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));
-        assert!(requests[5].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
-        assert!(requests[5].contains("<attach>true</attach><id><id>target-1</id></id>"));
-        assert!(requests[6].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[6].contains(&format!(
+        assert!(requests[6].starts_with("POST /e1crdbg/rdbg?cmd=attachDetachDbgTargets HTTP/1.1"));
+        assert!(requests[6].contains("<attach>true</attach><id><id>target-1</id></id>"));
+        assert!(requests[7].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
+        assert!(requests[7].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
         )));

@@ -5,7 +5,7 @@ mod metadata;
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
 use debug_server::{
-    CalculationPathItem, DebugEvaluation, DebugServer, DebugStackFrame, DebugUiEvent,
+    CalculationPathItem, DebugEvaluation, DebugServer, DebugStackFrame, DebugTarget, DebugUiEvent,
     DebugUiSession, DebugVariable, EvaluationInterface, ModuleBreakpoints, SourceBreakpoint,
     StepAction,
 };
@@ -503,6 +503,8 @@ impl Adapter {
             "setBreakpoints" => self.set_breakpoints(request),
             "setExceptionBreakpoints" => self.set_exception_breakpoints(request),
             "SetAutoAttachTargetTypesRequest" => self.set_auto_attach_target_types(request),
+            "DebugTargetsRequest" => self.debug_targets(request),
+            "AttachDebugTargetRequest" => self.attach_debug_target(request),
             "evaluate" => self.evaluate(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
@@ -894,6 +896,118 @@ impl Adapter {
         }
     }
 
+    fn debug_targets(&mut self, request: &Value) -> Vec<Value> {
+        let Some(server) = self.debug_server.clone() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let Some(session) = self.debug_session.clone() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        match server.get_debug_targets(&session) {
+            Ok(targets) => {
+                let items = targets
+                    .iter()
+                    .filter(|target| !self.threads.contains_key(&target.id))
+                    .map(debug_target_item)
+                    .collect::<Vec<_>>();
+                // Preserve the original extension's PascalCase custom-DAP
+                // contract. The VS Code view accepts this shape directly.
+                vec![response(
+                    request,
+                    self.next_sequence(),
+                    json!({ "Items": items }),
+                )]
+            }
+            Err(error) => vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )],
+        }
+    }
+
+    fn attach_debug_target(&mut self, request: &Value) -> Vec<Value> {
+        let target_id = request["arguments"]["Id"]
+            .as_str()
+            .or_else(|| request["arguments"]["id"].as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let Some(target_id) = target_id else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "AttachDebugTargetRequest requires arguments.Id",
+            )];
+        };
+        let Some(server) = self.debug_server.clone() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let Some(session) = self.debug_session.clone() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+
+        let target = match server.get_debug_targets(&session) {
+            Ok(targets) => targets.into_iter().find(|target| target.id == target_id),
+            Err(error) => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        // The original adapter intentionally treats a target that disappeared
+        // between refresh and click as a harmless no-op.
+        let Some(target) = target else {
+            return vec![response(request, self.next_sequence(), json!({}))];
+        };
+        if self.threads.contains_key(&target.id) {
+            return vec![response(request, self.next_sequence(), json!({}))];
+        }
+        if let Err(error) = server.clear_break_on_next_statement(&session) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                format!("cannot clear 1C break-on-next-statement: {error}"),
+            )];
+        }
+        if let Err(error) = server.attach_debug_targets(&session, std::slice::from_ref(&target.id))
+        {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                format!("cannot attach 1C target: {error}"),
+            )];
+        }
+        let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
+        self.threads.insert(target.id, thread_id);
+        vec![
+            response(request, self.next_sequence(), json!({})),
+            event(
+                self.next_sequence(),
+                "thread",
+                json!({ "reason": "started", "threadId": thread_id }),
+            ),
+            event(self.next_sequence(), "DebugTargetsUpdated", json!({})),
+        ]
+    }
+
     fn target_id(&self, thread_id: i64) -> Option<&str> {
         self.threads
             .iter()
@@ -1000,21 +1114,27 @@ impl Adapter {
                 }
                 let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
                 self.threads.insert(target_id, thread_id);
-                vec![event(
-                    self.next_sequence(),
-                    "thread",
-                    json!({ "reason": "started", "threadId": thread_id }),
-                )]
+                vec![
+                    event(
+                        self.next_sequence(),
+                        "thread",
+                        json!({ "reason": "started", "threadId": thread_id }),
+                    ),
+                    event(self.next_sequence(), "DebugTargetsUpdated", json!({})),
+                ]
             }
             ("targetQuit", Some(target_id)) => match self.threads.remove(&target_id) {
                 Some(thread_id) => {
                     self.call_stacks.remove(&thread_id);
                     self.clear_thread_references(thread_id);
-                    vec![event(
-                        self.next_sequence(),
-                        "thread",
-                        json!({ "reason": "exited", "threadId": thread_id }),
-                    )]
+                    vec![
+                        event(
+                            self.next_sequence(),
+                            "thread",
+                            json!({ "reason": "exited", "threadId": thread_id }),
+                        ),
+                        event(self.next_sequence(), "DebugTargetsUpdated", json!({})),
+                    ]
                 }
                 None => Vec::new(),
             },
@@ -1486,6 +1606,42 @@ impl Adapter {
     }
 }
 
+fn debug_target_item(target: &DebugTarget) -> Value {
+    json!({
+        "Id": target.id,
+        "User": if target.user_name.is_empty() {
+            "Неизвестный пользователь"
+        } else {
+            target.user_name.as_str()
+        },
+        "Type": debug_target_type_presentation(&target.target_type),
+        "Seance": target.seance_no,
+    })
+}
+
+fn debug_target_type_presentation(target_type: &str) -> &str {
+    match target_type {
+        "Unknown" => "Неизвестный тип",
+        "Client" => "Толстый клиент",
+        "ManagedClient" => "Тонкий клиент",
+        "WEBClient" | "WebClient" => "Веб-клиент",
+        "COMConnector" | "ComConnector" => "COM-соединение",
+        "Server" => "Сервер",
+        "ServerEmulation" => "Сервер (файловый вариант)",
+        "WEBService" | "WebService" => "Веб-сервис",
+        "HTTPService" | "HttpService" => "Http-сервис",
+        "OData" => "Стандартный интерфейс OData",
+        "JOB" | "Job" => "Фоновое задание",
+        "JobFileMode" => "Фоновое задание (файловый вариант)",
+        "MobileClient" => "Клиент (мобильное приложение)",
+        "MobileServer" => "Сервер (мобильное приложение)",
+        "MobileJobFileMode" => "Фоновое задание (мобильное приложение)",
+        "MobileManagedClient" => "Мобильный клиент",
+        "MobileManagedServer" => "Автономный сервер (мобильный клиент с автономным режимом)",
+        other => other,
+    }
+}
+
 fn dap_source_breakpoints(request: &Value) -> Result<Vec<SourceBreakpoint>> {
     let breakpoints = request["arguments"]["breakpoints"]
         .as_array()
@@ -1716,6 +1872,53 @@ mod tests {
             "type": "request",
             "command": "SetAutoAttachTargetTypesRequest",
             "arguments": { "types": [] },
+        });
+        let no_session_response = adapter.handle(&no_session);
+        assert!(!no_session_response[0]["success"].as_bool().unwrap());
+        assert_eq!(
+            no_session_response[0]["message"],
+            "no 1C debug session is attached"
+        );
+    }
+
+    #[test]
+    fn preserves_the_original_debug_targets_item_contract() {
+        let item = debug_target_item(&DebugTarget {
+            id: "target-1".to_owned(),
+            seance_no: "42".to_owned(),
+            user_name: String::new(),
+            target_type: "WEBClient".to_owned(),
+        });
+
+        assert_eq!(item["Id"], "target-1");
+        assert_eq!(item["Seance"], "42");
+        assert_eq!(item["User"], "Неизвестный пользователь");
+        assert_eq!(item["Type"], "Веб-клиент");
+    }
+
+    #[test]
+    fn validates_manual_debug_target_requests_before_network_access() {
+        let mut adapter = Adapter::default();
+        let missing_id = json!({
+            "seq": 15,
+            "type": "request",
+            "command": "AttachDebugTargetRequest",
+            "arguments": {},
+        });
+        let missing_id_response = adapter.handle(&missing_id);
+        assert!(!missing_id_response[0]["success"].as_bool().unwrap());
+        assert!(
+            missing_id_response[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("arguments.Id")
+        );
+
+        let no_session = json!({
+            "seq": 16,
+            "type": "request",
+            "command": "DebugTargetsRequest",
+            "arguments": {},
         });
         let no_session_response = adapter.handle(&no_session);
         assert!(!no_session_response[0]["success"].as_bool().unwrap());

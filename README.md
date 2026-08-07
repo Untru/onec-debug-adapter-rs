@@ -11,6 +11,7 @@
 - DAP `launch`, `attach`, breakpoints, exception breakpoints, stepping, pause, threads и disconnect;
 - source/condition/hit-count/logpoint для BSL-модулей основной конфигурации и расширений;
 - событие остановки, stack trace, раскрываемые локальные variables и evaluate/hover, включая отложенный RDBG `exprEvaluated`;
+- панель «Цели отладки» в VS Code: список доступных 1С-сеансов, ручное подключение и обновление списка при старте/завершении цели;
 - `launch` выбирает `1cv8c` из `platformPath` (указанная версия или `LATEST`) и запускает его с HTTP-отладкой; для файловой базы сам поднимает и затем останавливает `dbgs`, используя выделенный им порт;
 - CI проверяет форматирование, Clippy, unit-тесты и упаковку VSIX.
 
