@@ -134,6 +134,100 @@ fn version_key(version: &str) -> Vec<u32> {
         .collect()
 }
 
+fn info_base_alias(arguments: &ConnectionArguments) -> Result<String> {
+    if let Some(alias) = arguments
+        .info_base_alias
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(alias.to_owned());
+    }
+    let info_base = arguments
+        .info_base
+        .as_deref()
+        .context("launch/attach requires infoBase or infoBaseAlias")?;
+    for path in ibases_paths() {
+        if let Ok(contents) = fs::read_to_string(path) {
+            if let Some(alias) = launcher_alias(&contents, info_base) {
+                return Ok(alias);
+            }
+        }
+    }
+    Ok(info_base.to_owned())
+}
+
+fn ibases_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if cfg!(windows) {
+        if let Some(app_data) = std::env::var_os("APPDATA") {
+            paths.push(
+                PathBuf::from(app_data)
+                    .join("1C")
+                    .join("1CEStart")
+                    .join("ibases.v8i"),
+            );
+        }
+    } else if let Some(home_dir) = std::env::var_os("HOME") {
+        let home_dir = PathBuf::from(home_dir);
+        paths.push(
+            home_dir
+                .join(".1cv8")
+                .join("1C")
+                .join("1CEStart")
+                .join("ibases.v8i"),
+        );
+        paths.push(
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("1C")
+                .join("1CEStart")
+                .join("ibases.v8i"),
+        );
+    }
+    paths
+}
+
+fn launcher_alias(ibases: &str, info_base_name: &str) -> Option<String> {
+    let mut selected = false;
+    for raw_line in ibases.lines() {
+        let line = raw_line.trim();
+        if let Some(section_name) = line
+            .strip_prefix('[')
+            .and_then(|line| line.strip_suffix(']'))
+        {
+            selected = section_name.eq_ignore_ascii_case(info_base_name);
+            continue;
+        }
+        if !selected {
+            continue;
+        }
+        let Some(connect) = line.strip_prefix("Connect=") else {
+            continue;
+        };
+        if connect
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("file=")
+        {
+            return Some("DefAlias".to_owned());
+        }
+        return extract_connection_property(connect, "Ref");
+    }
+    None
+}
+
+fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
+    connection.split(';').find_map(|part| {
+        let (key, value) = part.split_once('=')?;
+        if key.trim().eq_ignore_ascii_case(property) {
+            Some(value.trim().trim_matches('"').to_owned())
+        } else {
+            None
+        }
+    })
+}
+
 impl Adapter {
     fn next_sequence(&mut self) -> u64 {
         self.next_sequence += 1;
@@ -233,12 +327,8 @@ impl Adapter {
             }
             None => None,
         };
-        let info_base_alias = arguments
-            .info_base_alias
-            .as_deref()
-            .or(arguments.info_base.as_deref())
-            .context("launch/attach requires infoBase or infoBaseAlias")?;
-        let session = server.attach_debug_ui(info_base_alias)?;
+        let info_base_alias = info_base_alias(&arguments)?;
+        let session = server.attach_debug_ui(&info_base_alias)?;
         if let Some(types) = &arguments.auto_attach_types {
             server.set_auto_attach_types(&session, types)?;
         }
@@ -1033,5 +1123,26 @@ mod tests {
             })
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn derives_server_alias_from_the_1c_launcher_connection() {
+        let ibases = r#"
+[Demo]
+Connect=Srvr="localhost";Ref="Accounting";
+
+[FileDemo]
+Connect=File="/tmp/demo";
+"#;
+
+        assert_eq!(
+            launcher_alias(ibases, "Demo"),
+            Some("Accounting".to_owned())
+        );
+        assert_eq!(
+            launcher_alias(ibases, "FileDemo"),
+            Some("DefAlias".to_owned())
+        );
+        assert_eq!(launcher_alias(ibases, "Missing"), None);
     }
 }
