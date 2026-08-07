@@ -57,6 +57,11 @@ impl Adapter {
                     "supportsLogPoints": true,
                     "supportsEvaluateForHovers": true,
                     "supportsTerminateRequest": true,
+                    "exceptionBreakpointFilters": [{
+                        "filter": "runtimeErrors",
+                        "label": "1C runtime errors",
+                        "default": false,
+                    }],
                 }),
             )],
             "launch" | "attach" => match self.connect(request) {
@@ -87,6 +92,7 @@ impl Adapter {
             "stepOut" => self.step(request, StepAction::StepOut),
             "pause" => self.pause(request),
             "setBreakpoints" => self.set_breakpoints(request),
+            "setExceptionBreakpoints" => self.set_exception_breakpoints(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
                 Err(error) => vec![error_response(
@@ -323,6 +329,48 @@ impl Adapter {
                     "source": { "path": source_path },
                 })).collect::<Vec<_>>(),
             }),
+        )]
+    }
+
+    fn set_exception_breakpoints(&mut self, request: &Value) -> Vec<Value> {
+        let filters = request["arguments"]["filters"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let filter_options = request["arguments"]["filterOptions"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let enabled = !filters.is_empty() || !filter_options.is_empty();
+        let error_template = filter_options
+            .iter()
+            .find_map(|option| option["condition"].as_str())
+            .filter(|condition| !condition.is_empty());
+        let Some(server) = &self.debug_server else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let Some(session) = &self.debug_session else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        if let Err(error) = server.set_runtime_error_processing(session, enabled, error_template) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )];
+        }
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "breakpoints": [{ "verified": true }] }),
         )]
     }
 

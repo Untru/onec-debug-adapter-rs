@@ -256,6 +256,21 @@ impl DebugServer {
             .map(|_| ())
     }
 
+    /// Enables or disables pauses on 1C runtime errors. When a template is
+    /// supplied, RDBG evaluates it against the error presentation.
+    pub fn set_runtime_error_processing(
+        &self,
+        session: &DebugUiSession,
+        stop_on_errors: bool,
+        error_template: Option<&str>,
+    ) -> Result<()> {
+        self.post_xml(
+            "setBreakOnRTE",
+            &runtime_error_processing_request(session, stop_on_errors, error_template),
+        )
+        .map(|_| ())
+    }
+
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
         let mut response = ureq::post(&url)
@@ -380,6 +395,31 @@ fn breakpoints_request(session: &DebugUiSession, modules: &[ModuleBreakpoints]) 
     base.replacen(
         "</request>",
         &format!("<bpWorkspace>{workspace}</bpWorkspace></request>"),
+        1,
+    )
+}
+
+fn runtime_error_processing_request(
+    session: &DebugUiSession,
+    stop_on_errors: bool,
+    error_template: Option<&str>,
+) -> String {
+    let analyze_error = error_template.is_some_and(|template| !template.is_empty());
+    let template = error_template
+        .filter(|template| !template.is_empty())
+        .map(|template| {
+            format!(
+                "<strTemplate><include>true</include><str>{}</str></strTemplate>",
+                xml_escape(template)
+            )
+        })
+        .unwrap_or_default();
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!(
+            "<state><stopOnErrors>{stop_on_errors}</stopOnErrors><analyzeErrorStr>{analyze_error}</analyzeErrorStr>{template}</state></request>"
+        ),
         1,
     )
 }
@@ -612,6 +652,19 @@ mod tests {
         assert!(xml.contains("<hitCount>5</hitCount>"));
         assert!(xml.contains("<putExpressionResult>A={A}</putExpressionResult>"));
         assert!(xml.contains("<continueExecution>true</continueExecution>"));
+    }
+
+    #[test]
+    fn serializes_runtime_error_filter() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let xml = runtime_error_processing_request(&session, true, Some("division by zero"));
+
+        assert!(xml.contains("<stopOnErrors>true</stopOnErrors>"));
+        assert!(xml.contains("<analyzeErrorStr>true</analyzeErrorStr>"));
+        assert!(xml.contains("<str>division by zero</str>"));
     }
 
     #[test]
