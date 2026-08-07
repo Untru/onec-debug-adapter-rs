@@ -575,14 +575,13 @@ impl Adapter {
                 return Err(error);
             }
         };
-        if let Some(types) = &arguments.auto_attach_types {
-            if let Err(error) = server.set_auto_attach_types(&session, types) {
-                let _ = server.detach_debug_ui(&session);
-                if let Some(spawned) = &mut spawned_debug_server {
-                    terminate_child(&mut spawned.child);
-                }
-                return Err(error);
+        let auto_attach_types = arguments.auto_attach_types.as_deref().unwrap_or_default();
+        if let Err(error) = server.set_auto_attach_types(&session, auto_attach_types) {
+            let _ = server.detach_debug_ui(&session);
+            if let Some(spawned) = &mut spawned_debug_server {
+                terminate_child(&mut spawned.child);
             }
+            return Err(error);
         }
         let debuggee = if launch {
             match launch_debuggee(&arguments, &server) {

@@ -1109,6 +1109,18 @@ mod tests {
     }
 
     #[test]
+    fn serializes_empty_auto_attach_settings() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+
+        let xml = auto_attach_settings_request(&session, &[]);
+
+        assert!(xml.contains("<autoAttachSettings></autoAttachSettings>"));
+    }
+
+    #[test]
     fn serializes_runtime_error_filter() {
         let session = DebugUiSession {
             id: "debug-ui".to_owned(),
