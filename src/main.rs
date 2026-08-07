@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, stderr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -168,7 +168,7 @@ fn launch_debuggee(arguments: &ConnectionArguments, server: &DebugServer) -> Res
 /// Starts the 1C RDBG sidecar used by a file infobase and waits until it
 /// publishes its selected port. Server infobases have a persistent RDBG
 /// service, but a file infobase needs this process for each debug session.
-fn launch_file_debug_server(platform_bin: &PathBuf, host: &str) -> Result<SpawnedDebugServer> {
+fn launch_file_debug_server(platform_bin: &Path, host: &str) -> Result<SpawnedDebugServer> {
     let executable = platform_bin.join(if cfg!(windows) { "dbgs.exe" } else { "dbgs" });
     if !executable.is_file() {
         anyhow::bail!(
@@ -254,7 +254,7 @@ fn terminate_child(child: &mut Child) {
     }
 }
 
-fn platform_bin(platform_path: &PathBuf, requested_version: Option<&str>) -> Result<PathBuf> {
+fn platform_bin(platform_path: &Path, requested_version: Option<&str>) -> Result<PathBuf> {
     let executable_name = if cfg!(windows) { "1cv8c.exe" } else { "1cv8c" };
     if platform_path.join(executable_name).is_file() {
         return Ok(platform_path.clone());
@@ -392,10 +392,6 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
         });
     }
     None
-}
-
-fn launcher_alias(ibases: &str, info_base_name: &str) -> Option<String> {
-    launcher_info_base(ibases, info_base_name).map(|target| target.alias)
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -1635,15 +1631,6 @@ Connect=File="/tmp/demo";
 "#;
 
         assert_eq!(
-            launcher_alias(ibases, "Demo"),
-            Some("Accounting".to_owned())
-        );
-        assert_eq!(
-            launcher_alias(ibases, "FileDemo"),
-            Some("DefAlias".to_owned())
-        );
-        assert_eq!(launcher_alias(ibases, "Missing"), None);
-        assert_eq!(
             launcher_info_base(ibases, "FileDemo"),
             Some(InfoBaseTarget {
                 alias: "DefAlias".to_owned(),
@@ -1657,6 +1644,7 @@ Connect=File="/tmp/demo";
                 is_file: false,
             })
         );
+        assert_eq!(launcher_info_base(ibases, "Missing"), None);
     }
 
     #[test]
