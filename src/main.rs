@@ -900,12 +900,10 @@ impl Adapter {
                     return Vec::new();
                 }
                 if let Err(error) = server.clear_break_on_next_statement(session) {
-                    return vec![
-                        self.output_event(
-                            "stderr",
-                            format!("cannot clear 1C break-on-next-statement: {error}\n"),
-                        ),
-                    ];
+                    return vec![self.output_event(
+                        "stderr",
+                        format!("cannot clear 1C break-on-next-statement: {error}\n"),
+                    )];
                 }
                 if let Err(error) =
                     server.attach_debug_targets(session, std::slice::from_ref(&target_id))

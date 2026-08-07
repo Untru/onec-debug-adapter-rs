@@ -1317,7 +1317,9 @@ mod tests {
         assert!(requests[2].contains("<targetType>Client</targetType>"));
         assert!(requests[2].contains("<targetType>HTTPService</targetType>"));
         assert!(requests[3].starts_with("POST /e1crdbg/rdbg?cmd=pingDebugUIParams&dbgui="));
-        assert!(requests[4].starts_with("POST /e1crdbg/rdbg?cmd=clearBreakOnNextStatement HTTP/1.1"));
+        assert!(
+            requests[4].starts_with("POST /e1crdbg/rdbg?cmd=clearBreakOnNextStatement HTTP/1.1")
+        );
         assert!(requests[4].contains(&format!(
             "<idOfDebuggerUI>{}</idOfDebuggerUI>",
             session.id()
