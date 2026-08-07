@@ -8,7 +8,10 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
@@ -161,7 +164,11 @@ fn read_dap_message(stdout: &mut impl BufRead) -> String {
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(1);
     while !path.is_file() {
-        assert!(Instant::now() < deadline, "timed out waiting for {}", path.display());
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
         thread::sleep(Duration::from_millis(5));
     }
 }
@@ -248,9 +255,21 @@ while true; do sleep 1; done
     assert!(client_args.contains("-http\n-attach"));
     assert!(client_args.contains(&format!("/DEBUGGERURL\nhttp://127.0.0.1:{}", rdbg.port)));
     let requests = rdbg.requests.lock().unwrap().clone();
-    assert!(requests.iter().any(|request| request.contains("cmd=rdbgTest")));
-    assert!(requests.iter().any(|request| request.contains("cmd=attachDebugUI")));
-    assert!(requests.iter().any(|request| request.contains("cmd=detachDebugUI")));
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("cmd=rdbgTest"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("cmd=attachDebugUI"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.contains("cmd=detachDebugUI"))
+    );
     rdbg.shutdown();
     fs::remove_dir_all(root).unwrap();
 }
