@@ -279,7 +279,10 @@ mod tests {
                 }
                 let mut body = vec![0; content_length];
                 reader.read_exact(&mut body).unwrap();
-                requests.push(format!("{request_line}{}", String::from_utf8(body).unwrap()));
+                requests.push(format!(
+                    "{request_line}{}",
+                    String::from_utf8(body).unwrap()
+                ));
 
                 write!(
                     stream,
@@ -303,6 +306,9 @@ mod tests {
         assert!(requests[1].contains("<infoBaseAlias>DemoBase</infoBaseAlias>"));
         assert!(requests[1].contains("<foregroundAbility>true</foregroundAbility>"));
         assert!(requests[2].starts_with("POST /e1crdbg/rdbg?cmd=detachDebugUI HTTP/1.1"));
-        assert!(requests[2].contains(&format!("<idOfDebuggerUI>{}</idOfDebuggerUI>", session.id())));
+        assert!(requests[2].contains(&format!(
+            "<idOfDebuggerUI>{}</idOfDebuggerUI>",
+            session.id()
+        )));
     }
 }
