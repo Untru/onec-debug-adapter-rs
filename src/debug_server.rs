@@ -166,7 +166,11 @@ impl DebugServer {
     /// Fetches pending Debug UI commands. The caller is responsible for
     /// translating these commands to DAP events.
     pub fn ping_debug_ui(&self, session: &DebugUiSession) -> Result<Vec<DebugUiEvent>> {
-        let url = format!("{}/rdbg?cmd=pingDebugUIParams&dbgui={}", self.endpoint, session.id());
+        let url = format!(
+            "{}/rdbg?cmd=pingDebugUIParams&dbgui={}",
+            self.endpoint,
+            session.id()
+        );
         let response = self.post_empty(&url, "pingDebugUIParams")?;
         Ok(response_elements(&response, "cmdID")?
             .into_iter()
