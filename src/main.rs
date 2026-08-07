@@ -498,15 +498,26 @@ impl Adapter {
     }
 
     fn poll(&mut self) -> Vec<Value> {
-        if let Some(debuggee) = &mut self.debuggee {
-            if let Some(status) = debuggee.try_wait().unwrap_or(None) {
-                self.debuggee = None;
-                return vec![event(
-                    self.next_sequence(),
-                    "terminated",
-                    json!({ "restart": false, "exitCode": status.code() }),
-                )];
+        let debuggee_status = self
+            .debuggee
+            .as_mut()
+            .and_then(|debuggee| debuggee.try_wait().unwrap_or(None));
+        if let Some(status) = debuggee_status {
+            self.debuggee = None;
+            let detach_error = self.disconnect().err();
+            let mut messages = vec![event(
+                self.next_sequence(),
+                "exited",
+                json!({ "exitCode": status.code().unwrap_or(-1) }),
+            )];
+            if let Some(error) = detach_error {
+                messages.push(self.output_event(
+                    "stderr",
+                    format!("cannot detach 1C Debug UI after client exit: {error}\\n"),
+                ));
             }
+            messages.push(event(self.next_sequence(), "terminated", json!({})));
+            return messages;
         }
         let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
             return Vec::new();
