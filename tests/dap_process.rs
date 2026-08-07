@@ -40,6 +40,8 @@ fn binary_serves_initialize_over_dap_stdio() {
     assert!(stdout.starts_with("Content-Length: "));
     assert!(stdout.contains("\"command\":\"initialize\""));
     assert!(stdout.contains("\"supportsConfigurationDoneRequest\":true"));
+    assert!(stdout.contains("\"supportsSingleThreadExecutionRequests\":true"));
+    assert!(stdout.contains("\"filter\":\"all\""));
 }
 
 #[cfg(unix)]

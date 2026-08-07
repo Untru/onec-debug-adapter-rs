@@ -428,9 +428,10 @@ impl Adapter {
                     "supportsLogPoints": true,
                     "supportsEvaluateForHovers": true,
                     "supportsTerminateRequest": true,
+                    "supportsSingleThreadExecutionRequests": true,
                     "supportsExceptionFilterOptions": true,
                     "exceptionBreakpointFilters": [{
-                        "filter": "runtimeErrors",
+                        "filter": "all",
                         "label": "1C runtime errors",
                         "default": false,
                     }],
@@ -639,8 +640,9 @@ impl Adapter {
             )];
         }
 
+        let all_threads_continued = request["arguments"]["singleThread"] != Value::Bool(true);
         let body = if action == StepAction::Continue {
-            json!({ "allThreadsContinued": false })
+            json!({ "allThreadsContinued": all_threads_continued })
         } else {
             json!({})
         };
@@ -649,7 +651,7 @@ impl Adapter {
             messages.push(event(
                 self.next_sequence(),
                 "continued",
-                json!({ "threadId": thread_id, "allThreadsContinued": false }),
+                json!({ "threadId": thread_id, "allThreadsContinued": all_threads_continued }),
             ));
         }
         messages
