@@ -371,7 +371,7 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
         })
         .flatten();
     let is_file =
-        direct_file_path.is_some() || launcher_target.is_some_and(|target| target.is_file);
+        direct_file_path.is_some() || launcher_target.as_ref().is_some_and(|target| target.is_file);
     let alias = if is_file {
         FILE_INFOBASE_ALIAS.to_owned()
     } else {
@@ -2032,7 +2032,10 @@ Connect=File="/tmp/demo";
         let connection = format!("File=\"{direct}\";");
 
         assert_eq!(direct_file_infobase_path(&direct), Some(directory.clone()));
-        assert_eq!(direct_file_infobase_path(&connection), Some(directory.clone()));
+        assert_eq!(
+            direct_file_infobase_path(&connection),
+            Some(directory.clone())
+        );
 
         let arguments = ConnectionArguments {
             debug_server_host: "localhost".to_owned(),
