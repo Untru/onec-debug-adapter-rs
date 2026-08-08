@@ -21,13 +21,14 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[derive(Default)]
 struct Adapter {
     next_sequence: u64,
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
     file_debug_server: Option<Child>,
     debuggee: Option<Child>,
+    pending_debuggee: Option<PendingDebuggee>,
+    debuggee_launcher: DebuggeeLauncher,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
     call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
@@ -36,6 +37,35 @@ struct Adapter {
     pending_evaluations: BTreeMap<String, PendingEvaluation>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
+}
+
+type DebuggeeLauncher = fn(&ConnectionArguments, &InfoBaseTarget, &DebugServer) -> Result<Child>;
+
+struct PendingDebuggee {
+    arguments: ConnectionArguments,
+    info_base: InfoBaseTarget,
+}
+
+impl Default for Adapter {
+    fn default() -> Self {
+        Self {
+            next_sequence: 0,
+            debug_server: None,
+            debug_session: None,
+            file_debug_server: None,
+            debuggee: None,
+            pending_debuggee: None,
+            debuggee_launcher: launch_debuggee,
+            poll_failed: false,
+            threads: BTreeMap::new(),
+            call_stacks: BTreeMap::new(),
+            next_variable_reference: 0,
+            variable_references: BTreeMap::new(),
+            pending_evaluations: BTreeMap::new(),
+            module_registry: None,
+            module_breakpoints: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -89,7 +119,7 @@ impl VariableReference {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConnectionArguments {
     #[serde(default = "default_debug_server_host")]
@@ -524,7 +554,14 @@ impl Adapter {
                     error.to_string(),
                 )],
             },
-            "configurationDone" => vec![response(request, self.next_sequence(), json!({}))],
+            "configurationDone" => match self.launch_pending_debuggee() {
+                Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
+                Err(error) => vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )],
+            },
             "threads" => vec![response(
                 request,
                 self.next_sequence(),
@@ -629,20 +666,6 @@ impl Adapter {
             }
             return Err(error);
         }
-        let debuggee = if launch {
-            match launch_debuggee(&arguments, &info_base, &server) {
-                Ok(debuggee) => Some(debuggee),
-                Err(error) => {
-                    let _ = server.detach_debug_ui(&session);
-                    if let Some(spawned) = &mut spawned_debug_server {
-                        terminate_child(&mut spawned.child);
-                    }
-                    return Err(error);
-                }
-            }
-        } else {
-            None
-        };
         eprintln!(
             "attached Debug UI {} to 1C debug server: {}",
             session.id(),
@@ -651,11 +674,34 @@ impl Adapter {
         self.debug_server = Some(server);
         self.debug_session = Some(session);
         self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
-        self.debuggee = debuggee;
+        self.pending_debuggee = launch.then_some(PendingDebuggee {
+            arguments,
+            info_base,
+        });
         self.poll_failed = false;
         self.module_registry = module_registry;
         self.module_breakpoints.clear();
         Ok(())
+    }
+
+    fn launch_pending_debuggee(&mut self) -> Result<()> {
+        let Some(pending) = self.pending_debuggee.take() else {
+            return Ok(());
+        };
+        let server = self
+            .debug_server
+            .as_ref()
+            .context("no 1C debug server is attached")?;
+        match (self.debuggee_launcher)(&pending.arguments, &pending.info_base, server) {
+            Ok(debuggee) => {
+                self.debuggee = Some(debuggee);
+                Ok(())
+            }
+            Err(error) => {
+                self.pending_debuggee = Some(pending);
+                Err(error)
+            }
+        }
     }
 
     fn disconnect(&mut self) -> Result<()> {
@@ -665,6 +711,7 @@ impl Adapter {
         };
         self.debug_session = None;
         self.debug_server = None;
+        self.pending_debuggee = None;
         if let Some(mut debug_server) = self.file_debug_server.take() {
             terminate_child(&mut debug_server);
         }
@@ -1768,6 +1815,94 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static DEBUGGEE_LAUNCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(unix)]
+    fn test_debuggee_launcher(
+        _: &ConnectionArguments,
+        _: &InfoBaseTarget,
+        _: &DebugServer,
+    ) -> Result<Child> {
+        DEBUGGEE_LAUNCH_COUNT.fetch_add(1, Ordering::SeqCst);
+        Command::new("sh")
+            .args(["-c", "sleep 60"])
+            .spawn()
+            .map_err(Into::into)
+    }
+
+    #[cfg(windows)]
+    fn test_debuggee_launcher(
+        _: &ConnectionArguments,
+        _: &InfoBaseTarget,
+        _: &DebugServer,
+    ) -> Result<Child> {
+        DEBUGGEE_LAUNCH_COUNT.fetch_add(1, Ordering::SeqCst);
+        Command::new("cmd")
+            .args(["/C", "timeout /T 60 /NOBREAK >NUL"])
+            .spawn()
+            .map_err(Into::into)
+    }
+
+    #[test]
+    fn defers_debuggee_launch_until_configuration_done() {
+        DEBUGGEE_LAUNCH_COUNT.store(0, Ordering::SeqCst);
+        let mut adapter = Adapter::default();
+        adapter.debuggee_launcher = test_debuggee_launcher;
+        adapter.debug_server = Some(DebugServer::new("127.0.0.1", 1550).unwrap());
+        adapter.pending_debuggee = Some(PendingDebuggee {
+            arguments: ConnectionArguments {
+                debug_server_host: "127.0.0.1".to_owned(),
+                debug_server_port: 1550,
+                info_base: Some("Demo".to_owned()),
+                info_base_alias: None,
+                root_project: None,
+                platform_path: None,
+                platform_version: None,
+                extensions: None,
+                auto_attach_types: None,
+            },
+            info_base: InfoBaseTarget {
+                alias: "Demo".to_owned(),
+                is_file: false,
+                direct_file_path: None,
+            },
+        });
+
+        assert_eq!(DEBUGGEE_LAUNCH_COUNT.load(Ordering::SeqCst), 0);
+        let breakpoints_response = adapter.handle(&json!({
+            "seq": 1,
+            "type": "request",
+            "command": "setBreakpoints",
+            "arguments": {
+                "source": { "path": "/tmp/module.bsl" },
+                "breakpoints": [{ "line": 1 }],
+            },
+        }));
+        assert!(!breakpoints_response[0]["success"].as_bool().unwrap());
+        assert_eq!(DEBUGGEE_LAUNCH_COUNT.load(Ordering::SeqCst), 0);
+
+        let configuration_done = adapter.handle(&json!({
+            "seq": 2,
+            "type": "request",
+            "command": "configurationDone",
+            "arguments": {},
+        }));
+        assert!(configuration_done[0]["success"].as_bool().unwrap());
+        assert_eq!(DEBUGGEE_LAUNCH_COUNT.load(Ordering::SeqCst), 1);
+        assert!(adapter.pending_debuggee.is_none());
+
+        let repeated_configuration_done = adapter.handle(&json!({
+            "seq": 3,
+            "type": "request",
+            "command": "configurationDone",
+            "arguments": {},
+        }));
+        assert!(repeated_configuration_done[0]["success"].as_bool().unwrap());
+        assert_eq!(DEBUGGEE_LAUNCH_COUNT.load(Ordering::SeqCst), 1);
+        adapter.disconnect().unwrap();
+    }
 
     #[test]
     fn returns_rdbg_call_stack_as_dap_stack_frames() {
