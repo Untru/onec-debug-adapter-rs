@@ -15,6 +15,7 @@ const AUTO_ATTACH_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugAutoAttac
 const BREAKPOINTS_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBreakpoints";
 const DEBUG_BASE_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugBaseData";
 const DEBUG_CALCULATIONS_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugCalculations";
+const RTE_FILTER_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugRTEFilter";
 
 /// A successfully registered 1C Debug UI session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -576,7 +577,7 @@ fn runtime_error_processing_request(
     base.replacen(
         "</request>",
         &format!(
-            "<state><stopOnErrors>{stop_on_errors}</stopOnErrors><analyzeErrorStr>{analyze_error}</analyzeErrorStr>{template}</state></request>"
+            "<state xmlns=\"{RTE_FILTER_NAMESPACE}\"><stopOnErrors>{stop_on_errors}</stopOnErrors><analyzeErrorStr>{analyze_error}</analyzeErrorStr>{template}</state></request>"
         ),
         1,
     )
@@ -1249,7 +1250,9 @@ mod tests {
         };
         let xml = runtime_error_processing_request(&session, true, Some("division by zero"));
 
-        assert!(xml.contains("<stopOnErrors>true</stopOnErrors>"));
+        assert!(xml.contains(&format!(
+            "<state xmlns=\"{RTE_FILTER_NAMESPACE}\"><stopOnErrors>true</stopOnErrors>"
+        )));
         assert!(xml.contains("<analyzeErrorStr>true</analyzeErrorStr>"));
         assert!(xml.contains("<str>division by zero</str>"));
     }
