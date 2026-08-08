@@ -1849,27 +1849,29 @@ mod tests {
     #[test]
     fn defers_debuggee_launch_until_configuration_done() {
         DEBUGGEE_LAUNCH_COUNT.store(0, Ordering::SeqCst);
-        let mut adapter = Adapter::default();
-        adapter.debuggee_launcher = test_debuggee_launcher;
-        adapter.debug_server = Some(DebugServer::new("127.0.0.1", 1550).unwrap());
-        adapter.pending_debuggee = Some(PendingDebuggee {
-            arguments: ConnectionArguments {
-                debug_server_host: "127.0.0.1".to_owned(),
-                debug_server_port: 1550,
-                info_base: Some("Demo".to_owned()),
-                info_base_alias: None,
-                root_project: None,
-                platform_path: None,
-                platform_version: None,
-                extensions: None,
-                auto_attach_types: None,
-            },
-            info_base: InfoBaseTarget {
-                alias: "Demo".to_owned(),
-                is_file: false,
-                direct_file_path: None,
-            },
-        });
+        let mut adapter = Adapter {
+            debuggee_launcher: test_debuggee_launcher,
+            debug_server: Some(DebugServer::new("127.0.0.1", 1550).unwrap()),
+            pending_debuggee: Some(PendingDebuggee {
+                arguments: ConnectionArguments {
+                    debug_server_host: "127.0.0.1".to_owned(),
+                    debug_server_port: 1550,
+                    info_base: Some("Demo".to_owned()),
+                    info_base_alias: None,
+                    root_project: None,
+                    platform_path: None,
+                    platform_version: None,
+                    extensions: None,
+                    auto_attach_types: None,
+                },
+                info_base: InfoBaseTarget {
+                    alias: "Demo".to_owned(),
+                    is_file: false,
+                    direct_file_path: None,
+                },
+            }),
+            ..Default::default()
+        };
 
         assert_eq!(DEBUGGEE_LAUNCH_COUNT.load(Ordering::SeqCst), 0);
         let breakpoints_response = adapter.handle(&json!({
