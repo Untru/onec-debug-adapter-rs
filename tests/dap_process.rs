@@ -215,6 +215,17 @@ fn read_dap_message(stdout: &mut impl BufRead) -> String {
 }
 
 #[cfg(unix)]
+fn read_dap_message_containing(stdout: &mut impl BufRead, expected: &str) -> String {
+    for _ in 0..8 {
+        let message = read_dap_message(stdout);
+        if message.contains(expected) {
+            return message;
+        }
+    }
+    panic!("did not receive DAP message containing {expected}");
+}
+
+#[cfg(unix)]
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(1);
     while !path.is_file() {
@@ -290,14 +301,22 @@ while true; do sleep 1; done
     );
     assert!(read_dap_message(&mut stdout).contains("\"command\":\"launch\""));
     assert!(read_dap_message(&mut stdout).contains("\"event\":\"initialized\""));
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":3,"type":"request","command":"configurationDone","arguments":{}}"#,
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"configurationDone\""));
     wait_for_file(&root.join("dbgs.args"));
     wait_for_file(&root.join("client.args"));
 
     send_dap_request(
         &mut stdin,
-        r#"{"seq":3,"type":"request","command":"disconnect","arguments":{}}"#,
+        r#"{"seq":4,"type":"request","command":"disconnect","arguments":{}}"#,
     );
-    assert!(read_dap_message(&mut stdout).contains("\"command\":\"disconnect\""));
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
+            .contains("\"success\":true")
+    );
     drop(stdin);
     assert!(child.wait().unwrap().success());
 

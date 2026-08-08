@@ -185,6 +185,7 @@ fn launch_debuggee(
         .strip_suffix("/e1crdbg")
         .unwrap_or(server.endpoint());
     let mut command = Command::new(&executable);
+    command.arg("ENTERPRISE");
     if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
     } else {
