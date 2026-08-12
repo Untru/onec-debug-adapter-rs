@@ -115,9 +115,19 @@ pub struct PingTimings {
     pub parse_elapsed: Duration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PingResult {
     pub events: Vec<DebugUiEvent>,
     pub timings: PingTimings,
+}
+
+/// Result of one Debug UI ping. A bounded ping is deliberately allowed to
+/// expire without being treated as a connection failure: it is used only to
+/// replace an older long-poll immediately after a resume command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PingOutcome {
+    Events(PingResult),
+    TimedOut,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -302,24 +312,33 @@ impl DebugServer {
 
     /// Fetches pending Debug UI commands and separates network wait from XML
     /// parsing so latency traces can identify the source of a slow step.
-    pub fn ping_debug_ui_timed(&self, session: &DebugUiSession) -> Result<PingResult> {
+    pub fn ping_debug_ui_timed(
+        &self,
+        session: &DebugUiSession,
+        receive_timeout: Option<Duration>,
+    ) -> Result<PingOutcome> {
         let url = format!(
             "{}/rdbg?cmd=pingDebugUIParams&dbgui={}",
             self.endpoint,
             session.id()
         );
         let http_started = Instant::now();
-        let response = self.post_empty(&url, "pingDebugUIParams")?;
+        let response =
+            match self.post_empty_with_timeout(&url, "pingDebugUIParams", receive_timeout) {
+                Ok(response) => response,
+                Err(PingRequestError::TimedOut) => return Ok(PingOutcome::TimedOut),
+                Err(PingRequestError::Failed(error)) => return Err(error),
+            };
         let http_elapsed = http_started.elapsed();
         let parse_started = Instant::now();
         let events = parse_debug_ui_events(&response)?;
-        Ok(PingResult {
+        Ok(PingOutcome::Events(PingResult {
             events,
             timings: PingTimings {
                 http_elapsed,
                 parse_elapsed: parse_started.elapsed(),
             },
-        })
+        }))
     }
 
     /// Attaches the Debug UI to the supplied execution contexts.
@@ -463,16 +482,42 @@ impl DebugServer {
             .context("cannot read XML response from 1C debug server")
     }
 
-    fn post_empty(&self, url: &str, command: &str) -> Result<String> {
-        let mut response = ureq::post(url)
-            .header("User-Agent", "1CV8")
-            .send_empty()
-            .with_context(|| format!("1C debug server request `{command}` failed"))?;
+    fn post_empty_with_timeout(
+        &self,
+        url: &str,
+        command: &str,
+        receive_timeout: Option<Duration>,
+    ) -> std::result::Result<String, PingRequestError> {
+        let response = match receive_timeout {
+            Some(timeout) => ureq::post(url)
+                .header("User-Agent", "1CV8")
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .send_empty(),
+            None => ureq::post(url).header("User-Agent", "1CV8").send_empty(),
+        };
+        let mut response = match response {
+            Ok(response) => response,
+            Err(ureq::Error::Timeout(_)) => return Err(PingRequestError::TimedOut),
+            Err(error) => {
+                return Err(PingRequestError::Failed(
+                    anyhow::Error::from(error)
+                        .context(format!("1C debug server request `{command}` failed")),
+                ));
+            }
+        };
         response
             .body_mut()
             .read_to_string()
             .context("cannot read XML response from 1C debug server")
+            .map_err(PingRequestError::Failed)
     }
+}
+
+enum PingRequestError {
+    TimedOut,
+    Failed(anyhow::Error),
 }
 
 fn attach_debug_ui_request(session: &DebugUiSession) -> String {
@@ -1471,7 +1516,10 @@ mod tests {
             }]
         );
         assert_eq!(
-            server.ping_debug_ui_timed(&session).unwrap().events,
+            match server.ping_debug_ui_timed(&session, None).unwrap() {
+                PingOutcome::Events(result) => result.events,
+                PingOutcome::TimedOut => panic!("unbounded ping unexpectedly timed out"),
+            },
             vec![DebugUiEvent {
                 command_id: "targetStarted".to_owned(),
                 target_id: Some("target-1".to_owned()),

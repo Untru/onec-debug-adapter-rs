@@ -10,7 +10,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::sync::{
     Arc, Condvar, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 #[cfg(unix)]
 use std::thread;
@@ -166,6 +166,88 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
         &mut stdin,
         r#"{"seq":5,"type":"request","command":"disconnect","arguments":{}}"#,
     );
+    let disconnect = read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"");
+    assert!(disconnect.contains("\"success\":true"), "{disconnect}");
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    let trace = fs::read_to_string(&trace_file).unwrap();
+    assert!(trace.contains("\"event\":\"dap.step.received\""));
+    assert!(trace.contains("\"event\":\"rdbg.step.response\""));
+    assert!(trace.contains("\"event\":\"rdbg.poll.worker_spawned\""));
+    fs::remove_file(trace_file).unwrap();
+    rdbg.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn step_replaces_held_poll_and_receives_stopped_without_waiting_for_it() {
+    let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
+    let rdbg = FakeRdbgServer::start_with_held_polls_then_stop_on_replacement();
+    let trace_file =
+        std::env::temp_dir().join(format!("onec-priority-poll-{}.jsonl", uuid::Uuid::new_v4()));
+    let trace_path = trace_file.to_string_lossy();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#,
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"initialize\""));
+    send_dap_request(
+        &mut stdin,
+        &format!(
+            r#"{{"seq":2,"type":"request","command":"attach","arguments":{{"infoBaseAlias":"Probe","debugServerHost":"127.0.0.1","debugServerPort":{},"trace":true,"traceFile":{:?}}}}}"#,
+            rdbg.port, trace_path
+        ),
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"attach\""));
+    assert!(read_dap_message(&mut stdout).contains("\"event\":\"initialized\""));
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":3,"type":"request","command":"AttachDebugTargetRequest","arguments":{"Id":"target-1"}}"#,
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"AttachDebugTargetRequest\"")
+            .contains("\"success\":true")
+    );
+    rdbg.wait_for_ping();
+
+    let started = Instant::now();
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":4,"type":"request","command":"stepIn","arguments":{"threadId":1}}"#,
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"stepIn\"")
+            .contains("\"success\":true")
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"event\":\"continued\"")
+            .contains("\"threadId\":1")
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"event\":\"stopped\"")
+            .contains("\"reason\":\"step\"")
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(700),
+        "stopped event waited for the old held poll: {:?}",
+        started.elapsed()
+    );
+    // The assertion above proves the new poll did not wait for either old
+    // connection. Release them before exercising ordinary session cleanup.
+    rdbg.release_pings_after(Duration::ZERO);
+
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":5,"type":"request","command":"disconnect","arguments":{}}"#,
+    );
     assert!(
         read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
             .contains("\"success\":true")
@@ -173,9 +255,9 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
     drop(stdin);
     assert!(child.wait().unwrap().success());
     let trace = fs::read_to_string(&trace_file).unwrap();
-    assert!(trace.contains("\"event\":\"dap.step.received\""));
-    assert!(trace.contains("\"event\":\"rdbg.step.response\""));
-    assert!(trace.contains("\"event\":\"rdbg.poll.worker_spawned\""));
+    assert!(trace.contains("\"event\":\"rdbg.poll.cancel_requested\""));
+    assert!(trace.contains("\"mode\":\"step-priority\""));
+    assert!(trace.contains("\"event\":\"rdbg.poll.timed_out\""));
     fs::remove_file(trace_file).unwrap();
     rdbg.shutdown();
 }
@@ -191,12 +273,32 @@ struct FakeRdbgServer {
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FakePingBehavior {
+    Normal,
+    HoldEveryPing,
+    HoldFirstTwoPingsThenStopOnReplacement,
+}
+
+#[cfg(unix)]
 impl FakeRdbgServer {
     fn start() -> Self {
-        Self::start_with_held_pings(false)
+        Self::start_with_ping_behavior(FakePingBehavior::Normal)
     }
 
     fn start_with_held_pings(hold_pings: bool) -> Self {
+        Self::start_with_ping_behavior(if hold_pings {
+            FakePingBehavior::HoldEveryPing
+        } else {
+            FakePingBehavior::Normal
+        })
+    }
+
+    fn start_with_held_polls_then_stop_on_replacement() -> Self {
+        Self::start_with_ping_behavior(FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement)
+    }
+
+    fn start_with_ping_behavior(ping_behavior: FakePingBehavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -204,10 +306,12 @@ impl FakeRdbgServer {
         let stop = Arc::new(AtomicBool::new(false));
         let ping_started = Arc::new((Mutex::new(false), Condvar::new()));
         let release_ping = Arc::new((Mutex::new(false), Condvar::new()));
+        let ping_count = Arc::new(AtomicUsize::new(0));
         let worker_requests = Arc::clone(&requests);
         let worker_stop = Arc::clone(&stop);
         let worker_ping_started = Arc::clone(&ping_started);
         let worker_release_ping = Arc::clone(&release_ping);
+        let worker_ping_count = Arc::clone(&ping_count);
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -215,13 +319,15 @@ impl FakeRdbgServer {
                         let requests = Arc::clone(&worker_requests);
                         let ping_started = Arc::clone(&worker_ping_started);
                         let release_ping = Arc::clone(&worker_release_ping);
+                        let ping_count = Arc::clone(&worker_ping_count);
                         thread::spawn(move || {
                             respond_to_rdbg_request(
                                 stream,
                                 requests,
-                                hold_pings,
+                                ping_behavior,
                                 ping_started,
                                 release_ping,
+                                ping_count,
                             );
                         });
                     }
@@ -280,15 +386,24 @@ impl FakeRdbgServer {
 fn respond_to_rdbg_request(
     mut stream: TcpStream,
     requests: Arc<Mutex<Vec<String>>>,
-    hold_pings: bool,
+    ping_behavior: FakePingBehavior,
     ping_started: Arc<(Mutex<bool>, Condvar)>,
     release_ping: Arc<(Mutex<bool>, Condvar)>,
+    ping_count: Arc<AtomicUsize>,
 ) {
     let Some(path) = read_http_request_path(&mut stream) else {
         return;
     };
     requests.lock().unwrap().push(path.clone());
-    if hold_pings && path.contains("cmd=pingDebugUIParams") {
+    let ping_number = path
+        .contains("cmd=pingDebugUIParams")
+        .then(|| ping_count.fetch_add(1, Ordering::SeqCst));
+    let hold_ping = match (ping_behavior, ping_number) {
+        (FakePingBehavior::HoldEveryPing, Some(_)) => true,
+        (FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement, Some(number)) => number != 2,
+        _ => false,
+    };
+    if hold_ping {
         let (started, ready) = &*ping_started;
         *started.lock().unwrap() = true;
         ready.notify_all();
@@ -297,8 +412,23 @@ fn respond_to_rdbg_request(
         while !*released {
             released = ready.wait(released).unwrap();
         }
+    } else if ping_number.is_some() {
+        // RDBG is a long-poll. A small wait avoids an unrealistic tight loop
+        // of empty responses while still letting cleanup RPCs run in their
+        // own connection immediately.
+        thread::sleep(Duration::from_millis(10));
     }
-    let body = if path.contains("cmd=attachDebugUI") {
+    let body = if ping_number == Some(2)
+        && ping_behavior == FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement
+    {
+        concat!(
+            "<response><result><cmdID>callStackFormed</cmdID><targetID><id>target-1</id>",
+            "</targetID><stopByBP>false</stopByBP><callStack><moduleID><extensionName>",
+            "</extensionName><objectID>object-id</objectID><propertyID>property-id</propertyID>",
+            "</moduleID><lineNo>42</lineNo><presentation>VGVzdE1ldGhvZA==</presentation>",
+            "</callStack></result></response>"
+        )
+    } else if path.contains("cmd=attachDebugUI") {
         "<response><result>registered</result></response>"
     } else if path.contains("cmd=detachDebugUI") {
         "<response><result>true</result></response>"
@@ -476,8 +606,10 @@ while true; do sleep 1; done
         &mut stdin,
         r#"{"seq":4,"type":"request","command":"disconnect","arguments":{}}"#,
     );
-    let disconnect = read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"");
-    assert!(disconnect.contains("\"success\":true"), "{disconnect}");
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
+            .contains("\"success\":true")
+    );
     drop(stdin);
     assert!(child.wait().unwrap().success());
 
