@@ -6,8 +6,8 @@ use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
 use debug_server::{
     CalculationPathItem, DebugEvaluation, DebugServer, DebugStackFrame, DebugTarget, DebugUiEvent,
-    DebugUiSession, DebugVariable, EvaluationInterface, ModuleBreakpoints, PingOutcome,
-    SourceBreakpoint, StepAction,
+    DebugUiSession, DebugVariable, EvaluationInterface, ModuleBreakpoints, SourceBreakpoint,
+    StepAction,
 };
 use metadata::ModuleRegistry;
 use serde::Deserialize;
@@ -17,8 +17,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write, stderr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,11 +29,12 @@ struct Adapter {
     debuggee: Option<Child>,
     pending_debuggee: Option<PendingDebuggee>,
     debuggee_launcher: DebuggeeLauncher,
-    /// The active, desired RDBG poll. A previous long poll can be cancelled
-    /// logically when a step needs a fresh one; its blocked HTTP worker then
-    /// becomes harmless and cannot delay the next stopped event.
-    pending_poll: Option<PendingPoll>,
-    next_poll_generation: u64,
+    /// The receiver remains present while the RDBG long-poll is running.
+    /// Keeping that wait off this thread is essential: this thread also owns
+    /// the DAP stdin/output loop and must be able to deliver step commands.
+    /// A new request is only created after this worker returns, because RDBG
+    /// does not safely support overlapping Debug UI pings for one session.
+    pending_poll: Option<mpsc::Receiver<PollResult>>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
     call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
@@ -59,51 +59,10 @@ struct PendingDebuggee {
 /// RDBG values are owned, so no adapter state needs to be shared or locked.
 struct PollResult {
     poll_id: u64,
-    generation: u64,
-    mode: PollMode,
     worker_started_ms: u128,
     http_completed_ms: Option<u128>,
     parse_completed_ms: Option<u128>,
-    result: PollCompletion,
-}
-
-struct PendingPoll {
-    poll_id: u64,
-    generation: u64,
-    mode: PollMode,
-    cancelled: Arc<AtomicBool>,
-    receiver: mpsc::Receiver<PollResult>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PollMode {
-    IdleLongPoll,
-    StepPriority,
-}
-
-impl PollMode {
-    fn trace_name(self) -> &'static str {
-        match self {
-            Self::IdleLongPoll => "idle-long-poll",
-            Self::StepPriority => "step-priority",
-        }
-    }
-
-    fn receive_timeout(self) -> Option<Duration> {
-        match self {
-            Self::IdleLongPoll => None,
-            // Do not shorten the normal long-poll. This bounded replacement
-            // only prevents a pre-step poll from withholding the next event.
-            Self::StepPriority => Some(Duration::from_millis(200)),
-        }
-    }
-}
-
-enum PollCompletion {
-    Events(Vec<DebugUiEvent>),
-    TimedOut,
-    Cancelled,
-    Failed(String),
+    result: std::result::Result<Vec<DebugUiEvent>, String>,
 }
 
 /// JSONL latency trace kept strictly on the DAP thread. Long-poll workers send
@@ -176,7 +135,6 @@ impl Default for Adapter {
             pending_debuggee: None,
             debuggee_launcher: launch_debuggee,
             pending_poll: None,
-            next_poll_generation: 0,
             poll_failed: false,
             threads: BTreeMap::new(),
             call_stacks: BTreeMap::new(),
@@ -827,8 +785,11 @@ impl Adapter {
             arguments,
             info_base,
         });
-        self.cancel_pending_poll("session-replaced", None);
-        self.next_poll_generation = 0;
+        // Do not replace a held ping with a new one: RDBG can leave the
+        // original server-side request alive after its client disconnects.
+        // Session replacement is not expected while attached; if it occurs,
+        // the old worker is detached from the adapter and owns its late result.
+        self.pending_poll = None;
         self.poll_failed = false;
         self.module_registry = module_registry;
         self.module_breakpoints.clear();
@@ -867,10 +828,10 @@ impl Adapter {
     }
 
     fn disconnect(&mut self) -> Result<()> {
-        // A ping may be held by RDBG for a long time. Cancelling it makes a
-        // late result harmless; the worker owns all request data and exits
-        // once RDBG releases the request.
-        self.cancel_pending_poll("session-ended", None);
+        // A ping may be held by RDBG for a long time. Dropping its receiver
+        // makes a late result harmless; the worker owns all request data and
+        // exits once RDBG releases the request.
+        self.pending_poll = None;
         let detach_result = match (&self.debug_server, &self.debug_session) {
             (Some(server), Some(session)) => server.detach_debug_ui(session),
             _ => Ok(()),
@@ -958,7 +919,6 @@ impl Adapter {
             json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "success": true }),
         );
         self.pending_steps.insert(target_id.clone(), trace_id);
-        self.replace_poll_after_step(trace_id);
 
         let all_threads_continued = request["arguments"]["singleThread"] != Value::Bool(true);
         let body = if action == StepAction::Continue {
@@ -1350,23 +1310,19 @@ impl Adapter {
             return messages;
         }
         let completed = match self.pending_poll.as_ref() {
-            Some(pending) => match pending.receiver.try_recv() {
+            Some(receiver) => match receiver.try_recv() {
                 Ok(result) => Some(result),
                 Err(mpsc::TryRecvError::Empty) => return Vec::new(),
                 // The only sender lives in the worker. A disconnect drops
                 // this receiver, so this means a worker unexpectedly exited.
                 Err(mpsc::TryRecvError::Disconnected) => {
-                    let pending = self.pending_poll.take().expect("pending poll disappeared");
+                    self.pending_poll = None;
                     Some(PollResult {
-                        poll_id: pending.poll_id,
-                        generation: pending.generation,
-                        mode: pending.mode,
+                        poll_id: 0,
                         worker_started_ms: 0,
                         http_completed_ms: None,
                         parse_completed_ms: None,
-                        result: PollCompletion::Failed(
-                            "1C debug server poll worker exited unexpectedly".to_owned(),
-                        ),
+                        result: Err("1C debug server poll worker exited unexpectedly".to_owned()),
                     })
                 }
             },
@@ -1374,72 +1330,14 @@ impl Adapter {
         };
 
         if let Some(completed) = completed {
-            let pending = self.pending_poll.take();
-            if let Some(pending) = pending
-                && pending.generation != completed.generation
-            {
-                self.trace(
-                    "rdbg.poll.discarded",
-                    json!({
-                        "pollId": completed.poll_id,
-                        "generation": completed.generation,
-                        "activeGeneration": pending.generation,
-                        "reason": "stale-generation",
-                    }),
-                );
-                self.pending_poll = Some(pending);
-                return Vec::new();
-            }
+            self.pending_poll = None;
             return self.handle_poll_result(completed);
         }
-        self.spawn_poll(self.next_poll_mode());
-        Vec::new()
-    }
-
-    fn next_poll_mode(&self) -> PollMode {
-        if self.pending_steps.is_empty() {
-            PollMode::IdleLongPoll
-        } else {
-            // While one or more targets are resuming, retry a bounded poll.
-            // At most one such request is desired at a time, so this caps the
-            // temporary retry rate at five requests per second and switches
-            // back to RDBG's efficient indefinite long-poll once stopped.
-            PollMode::StepPriority
-        }
-    }
-
-    fn replace_poll_after_step(&mut self, trace_id: u64) {
-        self.cancel_pending_poll("step", Some(trace_id));
-        self.spawn_poll(PollMode::StepPriority);
-    }
-
-    fn cancel_pending_poll(&mut self, reason: &str, trace_id: Option<u64>) {
-        let Some(pending) = self.pending_poll.take() else {
-            return;
-        };
-        pending.cancelled.store(true, Ordering::Release);
-        self.trace(
-            "rdbg.poll.cancel_requested",
-            json!({
-                "pollId": pending.poll_id,
-                "generation": pending.generation,
-                "reason": reason,
-                "traceId": trace_id,
-            }),
-        );
-    }
-
-    fn spawn_poll(&mut self, mode: PollMode) {
-        if self.pending_poll.is_some() {
-            return;
-        }
         let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
-            return;
+            return Vec::new();
         };
         let server = server.clone();
         let session = session.clone();
-        self.next_poll_generation += 1;
-        let generation = self.next_poll_generation;
         let poll_id = if self.trace.is_some() {
             self.next_trace_id()
         } else {
@@ -1447,26 +1345,16 @@ impl Adapter {
         };
         let trace_started = self.trace.as_ref().map(|trace| trace.started);
         if poll_id != 0 {
-            self.trace(
-                "rdbg.poll.worker_spawned",
-                json!({
-                    "pollId": poll_id,
-                    "generation": generation,
-                    "mode": mode.trace_name(),
-                    "receiveTimeoutMs": mode.receive_timeout().map(|timeout| timeout.as_millis()),
-                }),
-            );
+            self.trace("rdbg.poll.worker_spawned", json!({ "pollId": poll_id }));
         }
         let (sender, receiver) = mpsc::channel();
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let worker_cancelled = Arc::clone(&cancelled);
         thread::spawn(move || {
             let worker_started_ms = trace_started
                 .map(|started| started.elapsed().as_millis())
                 .unwrap_or(0);
-            let result = server.ping_debug_ui_timed(&session, mode.receive_timeout());
+            let result = server.ping_debug_ui_timed(&session);
             let (http_completed_ms, parse_completed_ms, result) = match result {
-                Ok(PingOutcome::Events(result)) => {
+                Ok(result) => {
                     let http_completed_ms = trace_started
                         .map(|_| worker_started_ms + result.timings.http_elapsed.as_millis());
                     let parse_completed_ms = trace_started.map(|_| {
@@ -1474,33 +1362,20 @@ impl Adapter {
                             + result.timings.http_elapsed.as_millis()
                             + result.timings.parse_elapsed.as_millis()
                     });
-                    let result = if worker_cancelled.load(Ordering::Acquire) {
-                        PollCompletion::Cancelled
-                    } else {
-                        PollCompletion::Events(result.events)
-                    };
-                    (http_completed_ms, parse_completed_ms, result)
+                    (http_completed_ms, parse_completed_ms, Ok(result.events))
                 }
-                Ok(PingOutcome::TimedOut) => (None, None, PollCompletion::TimedOut),
-                Err(error) => (None, None, PollCompletion::Failed(error.to_string())),
+                Err(error) => (None, None, Err(error.to_string())),
             };
             let _ = sender.send(PollResult {
                 poll_id,
-                generation,
-                mode,
                 worker_started_ms,
                 http_completed_ms,
                 parse_completed_ms,
                 result,
             });
         });
-        self.pending_poll = Some(PendingPoll {
-            poll_id,
-            generation,
-            mode,
-            cancelled,
-            receiver,
-        });
+        self.pending_poll = Some(receiver);
+        Vec::new()
     }
 
     fn handle_poll_result(&mut self, completed: PollResult) -> Vec<Value> {
@@ -1508,37 +1383,26 @@ impl Adapter {
             self.trace_at(
                 completed.worker_started_ms,
                 "rdbg.poll.worker_started",
-                json!({
-                    "pollId": completed.poll_id,
-                    "generation": completed.generation,
-                    "mode": completed.mode.trace_name(),
-                }),
+                json!({ "pollId": completed.poll_id }),
             );
             if let Some(http_completed_ms) = completed.http_completed_ms {
                 self.trace_at(
                     http_completed_ms,
                     "rdbg.poll.http_completed",
-                    json!({ "pollId": completed.poll_id, "generation": completed.generation }),
+                    json!({ "pollId": completed.poll_id }),
                 );
             }
             if let Some(parse_completed_ms) = completed.parse_completed_ms {
                 self.trace_at(
                     parse_completed_ms,
                     "rdbg.poll.parse_completed",
-                    json!({ "pollId": completed.poll_id, "generation": completed.generation }),
+                    json!({ "pollId": completed.poll_id }),
                 );
             }
-            self.trace(
-                "rdbg.poll.received",
-                json!({
-                    "pollId": completed.poll_id,
-                    "generation": completed.generation,
-                    "mode": completed.mode.trace_name(),
-                }),
-            );
+            self.trace("rdbg.poll.received", json!({ "pollId": completed.poll_id }));
         }
         match completed.result {
-            PollCompletion::Events(events) => {
+            Ok(events) => {
                 self.poll_failed = false;
                 let (Some(server), Some(session)) =
                     (self.debug_server.clone(), self.debug_session.clone())
@@ -1550,29 +1414,7 @@ impl Adapter {
                     .flat_map(|debug_event| self.handle_debug_event(&server, &session, debug_event))
                     .collect()
             }
-            PollCompletion::TimedOut => {
-                self.trace(
-                    "rdbg.poll.timed_out",
-                    json!({
-                        "pollId": completed.poll_id,
-                        "generation": completed.generation,
-                        "mode": completed.mode.trace_name(),
-                    }),
-                );
-                Vec::new()
-            }
-            PollCompletion::Cancelled => {
-                self.trace(
-                    "rdbg.poll.discarded",
-                    json!({
-                        "pollId": completed.poll_id,
-                        "generation": completed.generation,
-                        "reason": "cancelled",
-                    }),
-                );
-                Vec::new()
-            }
-            PollCompletion::Failed(error) if !self.poll_failed => {
+            Err(error) if !self.poll_failed => {
                 self.poll_failed = true;
                 vec![event(
                     self.next_sequence(),
@@ -1583,7 +1425,7 @@ impl Adapter {
                     }),
                 )]
             }
-            PollCompletion::Failed(_) => Vec::new(),
+            Err(_) => Vec::new(),
         }
     }
 

@@ -161,6 +161,22 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
         read_dap_message_containing(&mut stdout, "\"event\":\"continued\"")
             .contains("\"threadId\":1")
     );
+    // A client-side timeout or logical cancellation does not cancel the
+    // server-side RDBG request.  Starting another ping here would leave two
+    // live requests for the same Debug UI and can wedge a real 1C server.
+    // The old request remains held for another 450 ms, so a second request
+    // would be visible well before this assertion.
+    thread::sleep(Duration::from_millis(250));
+    assert_eq!(rdbg.ping_count(), 1, "step started another live RDBG ping");
+    assert_eq!(
+        rdbg.max_concurrent_pings(),
+        1,
+        "adapter issued concurrent RDBG pings for one Debug UI"
+    );
+    // Let the real poll finish before invoking the cleanup RPC.  Some RDBG
+    // servers serialize this RPC behind their active long-poll.
+    rdbg.release_pings_after(Duration::ZERO);
+    thread::sleep(Duration::from_millis(30));
 
     send_dap_request(
         &mut stdin,
@@ -179,96 +195,14 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
 }
 
 #[cfg(unix)]
-#[test]
-fn step_replaces_held_poll_and_receives_stopped_without_waiting_for_it() {
-    let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
-    let rdbg = FakeRdbgServer::start_with_held_polls_then_stop_on_replacement();
-    let trace_file =
-        std::env::temp_dir().join(format!("onec-priority-poll-{}.jsonl", uuid::Uuid::new_v4()));
-    let trace_path = trace_file.to_string_lossy();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let mut stdin = child.stdin.take().unwrap();
-    let mut stdout = BufReader::new(child.stdout.take().unwrap());
-
-    send_dap_request(
-        &mut stdin,
-        r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#,
-    );
-    assert!(read_dap_message(&mut stdout).contains("\"command\":\"initialize\""));
-    send_dap_request(
-        &mut stdin,
-        &format!(
-            r#"{{"seq":2,"type":"request","command":"attach","arguments":{{"infoBaseAlias":"Probe","debugServerHost":"127.0.0.1","debugServerPort":{},"trace":true,"traceFile":{:?}}}}}"#,
-            rdbg.port, trace_path
-        ),
-    );
-    assert!(read_dap_message(&mut stdout).contains("\"command\":\"attach\""));
-    assert!(read_dap_message(&mut stdout).contains("\"event\":\"initialized\""));
-    send_dap_request(
-        &mut stdin,
-        r#"{"seq":3,"type":"request","command":"AttachDebugTargetRequest","arguments":{"Id":"target-1"}}"#,
-    );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"command\":\"AttachDebugTargetRequest\"")
-            .contains("\"success\":true")
-    );
-    rdbg.wait_for_ping();
-
-    let started = Instant::now();
-    send_dap_request(
-        &mut stdin,
-        r#"{"seq":4,"type":"request","command":"stepIn","arguments":{"threadId":1}}"#,
-    );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"command\":\"stepIn\"")
-            .contains("\"success\":true")
-    );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"event\":\"continued\"")
-            .contains("\"threadId\":1")
-    );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"event\":\"stopped\"")
-            .contains("\"reason\":\"step\"")
-    );
-    assert!(
-        started.elapsed() < Duration::from_millis(700),
-        "stopped event waited for the old held poll: {:?}",
-        started.elapsed()
-    );
-    // The assertion above proves the new poll did not wait for either old
-    // connection. Release them before exercising ordinary session cleanup.
-    rdbg.release_pings_after(Duration::ZERO);
-
-    send_dap_request(
-        &mut stdin,
-        r#"{"seq":5,"type":"request","command":"disconnect","arguments":{}}"#,
-    );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
-            .contains("\"success\":true")
-    );
-    drop(stdin);
-    assert!(child.wait().unwrap().success());
-    let trace = fs::read_to_string(&trace_file).unwrap();
-    assert!(trace.contains("\"event\":\"rdbg.poll.cancel_requested\""));
-    assert!(trace.contains("\"mode\":\"step-priority\""));
-    assert!(trace.contains("\"event\":\"rdbg.poll.timed_out\""));
-    fs::remove_file(trace_file).unwrap();
-    rdbg.shutdown();
-}
-
-#[cfg(unix)]
 struct FakeRdbgServer {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
     ping_started: Arc<(Mutex<bool>, Condvar)>,
     release_ping: Arc<(Mutex<bool>, Condvar)>,
+    ping_count: Arc<AtomicUsize>,
+    max_concurrent_pings: Arc<AtomicUsize>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
@@ -277,7 +211,14 @@ struct FakeRdbgServer {
 enum FakePingBehavior {
     Normal,
     HoldEveryPing,
-    HoldFirstTwoPingsThenStopOnReplacement,
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+struct FakePingMetrics {
+    count: Arc<AtomicUsize>,
+    concurrent: Arc<AtomicUsize>,
+    max_concurrent: Arc<AtomicUsize>,
 }
 
 #[cfg(unix)]
@@ -294,10 +235,6 @@ impl FakeRdbgServer {
         })
     }
 
-    fn start_with_held_polls_then_stop_on_replacement() -> Self {
-        Self::start_with_ping_behavior(FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement)
-    }
-
     fn start_with_ping_behavior(ping_behavior: FakePingBehavior) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -306,12 +243,16 @@ impl FakeRdbgServer {
         let stop = Arc::new(AtomicBool::new(false));
         let ping_started = Arc::new((Mutex::new(false), Condvar::new()));
         let release_ping = Arc::new((Mutex::new(false), Condvar::new()));
-        let ping_count = Arc::new(AtomicUsize::new(0));
+        let ping_metrics = FakePingMetrics {
+            count: Arc::new(AtomicUsize::new(0)),
+            concurrent: Arc::new(AtomicUsize::new(0)),
+            max_concurrent: Arc::new(AtomicUsize::new(0)),
+        };
         let worker_requests = Arc::clone(&requests);
         let worker_stop = Arc::clone(&stop);
         let worker_ping_started = Arc::clone(&ping_started);
         let worker_release_ping = Arc::clone(&release_ping);
-        let worker_ping_count = Arc::clone(&ping_count);
+        let worker_ping_metrics = ping_metrics.clone();
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -319,7 +260,7 @@ impl FakeRdbgServer {
                         let requests = Arc::clone(&worker_requests);
                         let ping_started = Arc::clone(&worker_ping_started);
                         let release_ping = Arc::clone(&worker_release_ping);
-                        let ping_count = Arc::clone(&worker_ping_count);
+                        let ping_metrics = worker_ping_metrics.clone();
                         thread::spawn(move || {
                             respond_to_rdbg_request(
                                 stream,
@@ -327,7 +268,7 @@ impl FakeRdbgServer {
                                 ping_behavior,
                                 ping_started,
                                 release_ping,
-                                ping_count,
+                                ping_metrics,
                             );
                         });
                     }
@@ -344,6 +285,8 @@ impl FakeRdbgServer {
             stop,
             ping_started,
             release_ping,
+            ping_count: ping_metrics.count,
+            max_concurrent_pings: ping_metrics.max_concurrent,
             worker: Some(worker),
         }
     }
@@ -373,6 +316,14 @@ impl FakeRdbgServer {
         });
     }
 
+    fn ping_count(&self) -> usize {
+        self.ping_count.load(Ordering::SeqCst)
+    }
+
+    fn max_concurrent_pings(&self) -> usize {
+        self.max_concurrent_pings.load(Ordering::SeqCst)
+    }
+
     fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
         let (released, ready) = &*self.release_ping;
@@ -389,7 +340,7 @@ fn respond_to_rdbg_request(
     ping_behavior: FakePingBehavior,
     ping_started: Arc<(Mutex<bool>, Condvar)>,
     release_ping: Arc<(Mutex<bool>, Condvar)>,
-    ping_count: Arc<AtomicUsize>,
+    ping_metrics: FakePingMetrics,
 ) {
     let Some(path) = read_http_request_path(&mut stream) else {
         return;
@@ -397,12 +348,17 @@ fn respond_to_rdbg_request(
     requests.lock().unwrap().push(path.clone());
     let ping_number = path
         .contains("cmd=pingDebugUIParams")
-        .then(|| ping_count.fetch_add(1, Ordering::SeqCst));
-    let hold_ping = match (ping_behavior, ping_number) {
-        (FakePingBehavior::HoldEveryPing, Some(_)) => true,
-        (FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement, Some(number)) => number != 2,
-        _ => false,
-    };
+        .then(|| ping_metrics.count.fetch_add(1, Ordering::SeqCst));
+    if ping_number.is_some() {
+        let active = ping_metrics.concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+        ping_metrics
+            .max_concurrent
+            .fetch_max(active, Ordering::SeqCst);
+    }
+    let hold_ping = matches!(
+        (ping_behavior, ping_number),
+        (FakePingBehavior::HoldEveryPing, Some(_))
+    );
     if hold_ping {
         let (started, ready) = &*ping_started;
         *started.lock().unwrap() = true;
@@ -418,17 +374,7 @@ fn respond_to_rdbg_request(
         // own connection immediately.
         thread::sleep(Duration::from_millis(10));
     }
-    let body = if ping_number == Some(2)
-        && ping_behavior == FakePingBehavior::HoldFirstTwoPingsThenStopOnReplacement
-    {
-        concat!(
-            "<response><result><cmdID>callStackFormed</cmdID><targetID><id>target-1</id>",
-            "</targetID><stopByBP>false</stopByBP><callStack><moduleID><extensionName>",
-            "</extensionName><objectID>object-id</objectID><propertyID>property-id</propertyID>",
-            "</moduleID><lineNo>42</lineNo><presentation>VGVzdE1ldGhvZA==</presentation>",
-            "</callStack></result></response>"
-        )
-    } else if path.contains("cmd=attachDebugUI") {
+    let body = if path.contains("cmd=attachDebugUI") {
         "<response><result>registered</result></response>"
     } else if path.contains("cmd=detachDebugUI") {
         "<response><result>true</result></response>"
@@ -449,6 +395,9 @@ fn respond_to_rdbg_request(
         body
     );
     stream.write_all(response.as_bytes()).unwrap();
+    if ping_number.is_some() {
+        ping_metrics.concurrent.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(unix)]
