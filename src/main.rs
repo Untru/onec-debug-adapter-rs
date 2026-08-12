@@ -29,6 +29,10 @@ struct Adapter {
     debuggee: Option<Child>,
     pending_debuggee: Option<PendingDebuggee>,
     debuggee_launcher: DebuggeeLauncher,
+    /// The receiver remains present while the RDBG long-poll is running.
+    /// Keeping that wait off this thread is essential: this thread also owns
+    /// the DAP stdin/output loop and must be able to deliver step commands.
+    pending_poll: Option<mpsc::Receiver<PollResult>>,
     poll_failed: bool,
     threads: BTreeMap<String, i64>,
     call_stacks: BTreeMap<i64, Vec<DebugStackFrame>>,
@@ -46,6 +50,12 @@ struct PendingDebuggee {
     info_base: InfoBaseTarget,
 }
 
+/// The only result that crosses from the long-poll worker to the DAP thread.
+/// RDBG values are owned, so no adapter state needs to be shared or locked.
+struct PollResult {
+    result: std::result::Result<Vec<DebugUiEvent>, String>,
+}
+
 impl Default for Adapter {
     fn default() -> Self {
         Self {
@@ -56,6 +66,7 @@ impl Default for Adapter {
             debuggee: None,
             pending_debuggee: None,
             debuggee_launcher: launch_debuggee,
+            pending_poll: None,
             poll_failed: false,
             threads: BTreeMap::new(),
             call_stacks: BTreeMap::new(),
@@ -679,6 +690,7 @@ impl Adapter {
             arguments,
             info_base,
         });
+        self.pending_poll = None;
         self.poll_failed = false;
         self.module_registry = module_registry;
         self.module_breakpoints.clear();
@@ -706,6 +718,10 @@ impl Adapter {
     }
 
     fn disconnect(&mut self) -> Result<()> {
+        // A ping may be held by RDBG for a long time. Dropping its receiver
+        // makes a late result harmless; the worker owns all request data and
+        // exits once RDBG releases the request.
+        self.pending_poll = None;
         let detach_result = match (&self.debug_server, &self.debug_session) {
             (Some(server), Some(session)) => server.detach_debug_ui(session),
             _ => Ok(()),
@@ -773,13 +789,13 @@ impl Adapter {
             json!({})
         };
         let mut messages = vec![response(request, self.next_sequence(), body)];
-        if action == StepAction::Continue {
-            messages.push(event(
-                self.next_sequence(),
-                "continued",
-                json!({ "threadId": thread_id, "allThreadsContinued": all_threads_continued }),
-            ));
-        }
+        // All four resume commands make the target run. VS Code relies on
+        // this notification to clear its stopped state after F10/F11 too.
+        messages.push(event(
+            self.next_sequence(),
+            "continued",
+            json!({ "threadId": thread_id, "allThreadsContinued": all_threads_continued }),
+        ));
         messages
     }
 
@@ -1147,15 +1163,52 @@ impl Adapter {
             messages.push(event(self.next_sequence(), "terminated", json!({})));
             return messages;
         }
+        let completed = match self.pending_poll.as_ref() {
+            Some(receiver) => match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => return Vec::new(),
+                // The only sender lives in the worker. A disconnect drops
+                // this receiver, so this means a worker unexpectedly exited.
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.pending_poll = None;
+                    Some(PollResult {
+                        result: Err("1C debug server poll worker exited unexpectedly".to_owned()),
+                    })
+                }
+            },
+            None => None,
+        };
+
+        if let Some(completed) = completed {
+            self.pending_poll = None;
+            return self.handle_poll_result(completed);
+        }
+
         let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
             return Vec::new();
         };
         let server = server.clone();
         let session = session.clone();
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            let result = server
+                .ping_debug_ui(&session)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(PollResult { result });
+        });
+        self.pending_poll = Some(receiver);
+        Vec::new()
+    }
 
-        match server.ping_debug_ui(&session) {
+    fn handle_poll_result(&mut self, completed: PollResult) -> Vec<Value> {
+        match completed.result {
             Ok(events) => {
                 self.poll_failed = false;
+                let (Some(server), Some(session)) =
+                    (self.debug_server.clone(), self.debug_session.clone())
+                else {
+                    return Vec::new();
+                };
                 events
                     .into_iter()
                     .flat_map(|debug_event| self.handle_debug_event(&server, &session, debug_event))

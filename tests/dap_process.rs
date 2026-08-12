@@ -9,13 +9,16 @@ use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 #[cfg(unix)]
 use std::sync::{
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 #[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+static RDBG_PROCESS_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn binary_serves_initialize_over_dap_stdio() {
@@ -47,6 +50,7 @@ fn binary_serves_initialize_over_dap_stdio() {
 #[cfg(unix)]
 #[test]
 fn adapter_detaches_debug_ui_when_dap_input_closes() {
+    let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
     let rdbg = FakeRdbgServer::start();
     let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
         .stdin(Stdio::piped())
@@ -97,46 +101,121 @@ fn adapter_detaches_debug_ui_when_dap_input_closes() {
 }
 
 #[cfg(unix)]
+#[test]
+fn pending_rdbg_poll_does_not_delay_step_in_request() {
+    let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
+    let rdbg = FakeRdbgServer::start_with_held_pings(true);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":1,"type":"request","command":"initialize","arguments":{}}"#,
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"initialize\""));
+    send_dap_request(
+        &mut stdin,
+        &format!(
+            r#"{{"seq":2,"type":"request","command":"attach","arguments":{{"infoBaseAlias":"Probe","debugServerHost":"127.0.0.1","debugServerPort":{}}}}}"#,
+            rdbg.port
+        ),
+    );
+    assert!(read_dap_message(&mut stdout).contains("\"command\":\"attach\""));
+    assert!(read_dap_message(&mut stdout).contains("\"event\":\"initialized\""));
+
+    // Establish a DAP thread before holding the next RDBG ping indefinitely.
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":3,"type":"request","command":"AttachDebugTargetRequest","arguments":{"Id":"target-1"}}"#,
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"AttachDebugTargetRequest\"")
+            .contains("\"success\":true")
+    );
+    rdbg.wait_for_ping();
+
+    // A synchronous ping would withhold this response until the 750 ms
+    // release below. The worker-based adapter must respond while it is held.
+    rdbg.release_pings_after(Duration::from_millis(750));
+    let started = Instant::now();
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":4,"type":"request","command":"stepIn","arguments":{"threadId":1}}"#,
+    );
+    let response = read_dap_message_containing(&mut stdout, "\"command\":\"stepIn\"");
+    assert!(response.contains("\"success\":true"));
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "stepIn was delayed by the held RDBG poll: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"event\":\"continued\"")
+            .contains("\"threadId\":1")
+    );
+
+    send_dap_request(
+        &mut stdin,
+        r#"{"seq":5,"type":"request","command":"disconnect","arguments":{}}"#,
+    );
+    assert!(
+        read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
+            .contains("\"success\":true")
+    );
+    drop(stdin);
+    assert!(child.wait().unwrap().success());
+    rdbg.shutdown();
+}
+
+#[cfg(unix)]
 struct FakeRdbgServer {
     port: u16,
     requests: Arc<Mutex<Vec<String>>>,
     stop: Arc<AtomicBool>,
+    ping_started: Arc<(Mutex<bool>, Condvar)>,
+    release_ping: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 #[cfg(unix)]
 impl FakeRdbgServer {
     fn start() -> Self {
+        Self::start_with_held_pings(false)
+    }
+
+    fn start_with_held_pings(hold_pings: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let ping_started = Arc::new((Mutex::new(false), Condvar::new()));
+        let release_ping = Arc::new((Mutex::new(false), Condvar::new()));
         let worker_requests = Arc::clone(&requests);
         let worker_stop = Arc::clone(&stop);
+        let worker_ping_started = Arc::clone(&ping_started);
+        let worker_release_ping = Arc::clone(&release_ping);
         let worker = thread::spawn(move || {
             while !worker_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        if let Some(path) = read_http_request_path(&mut stream) {
-                            worker_requests.lock().unwrap().push(path.clone());
-                            let body = if path.contains("cmd=attachDebugUI") {
-                                "<response><result>registered</result></response>"
-                            } else if path.contains("cmd=detachDebugUI") {
-                                "<response><result>true</result></response>"
-                            } else {
-                                "<response/>"
-                            };
-                            let response = format!(
-                                concat!(
-                                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n",
-                                    "Content-Length: {}\r\nConnection: close\r\n\r\n{}"
-                                ),
-                                body.len(),
-                                body
+                    Ok((stream, _)) => {
+                        let requests = Arc::clone(&worker_requests);
+                        let ping_started = Arc::clone(&worker_ping_started);
+                        let release_ping = Arc::clone(&worker_release_ping);
+                        thread::spawn(move || {
+                            respond_to_rdbg_request(
+                                stream,
+                                requests,
+                                hold_pings,
+                                ping_started,
+                                release_ping,
                             );
-                            stream.write_all(response.as_bytes()).unwrap();
-                        }
+                        });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(5));
@@ -149,14 +228,89 @@ impl FakeRdbgServer {
             port,
             requests,
             stop,
+            ping_started,
+            release_ping,
             worker: Some(worker),
         }
     }
 
+    fn wait_for_ping(&self) {
+        let (started, ready) = &*self.ping_started;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut started = started.lock().unwrap();
+        while !*started {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "adapter did not start the expected RDBG long-poll"
+            );
+            let (next, _) = ready.wait_timeout(started, remaining).unwrap();
+            started = next;
+        }
+    }
+
+    fn release_pings_after(&self, delay: Duration) {
+        let release_ping = Arc::clone(&self.release_ping);
+        thread::spawn(move || {
+            thread::sleep(delay);
+            let (released, ready) = &*release_ping;
+            *released.lock().unwrap() = true;
+            ready.notify_all();
+        });
+    }
+
     fn shutdown(mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        let (released, ready) = &*self.release_ping;
+        *released.lock().unwrap() = true;
+        ready.notify_all();
         self.worker.take().unwrap().join().unwrap();
     }
+}
+
+#[cfg(unix)]
+fn respond_to_rdbg_request(
+    mut stream: TcpStream,
+    requests: Arc<Mutex<Vec<String>>>,
+    hold_pings: bool,
+    ping_started: Arc<(Mutex<bool>, Condvar)>,
+    release_ping: Arc<(Mutex<bool>, Condvar)>,
+) {
+    let Some(path) = read_http_request_path(&mut stream) else {
+        return;
+    };
+    requests.lock().unwrap().push(path.clone());
+    if hold_pings && path.contains("cmd=pingDebugUIParams") {
+        let (started, ready) = &*ping_started;
+        *started.lock().unwrap() = true;
+        ready.notify_all();
+        let (released, ready) = &*release_ping;
+        let mut released = released.lock().unwrap();
+        while !*released {
+            released = ready.wait(released).unwrap();
+        }
+    }
+    let body = if path.contains("cmd=attachDebugUI") {
+        "<response><result>registered</result></response>"
+    } else if path.contains("cmd=detachDebugUI") {
+        "<response><result>true</result></response>"
+    } else if path.contains("cmd=getDbgTargets") {
+        concat!(
+            "<response><id><id>target-1</id><seanceNo>1</seanceNo>",
+            "<userName>Probe</userName><targetType>ManagedClient</targetType></id></response>"
+        )
+    } else {
+        "<response/>"
+    };
+    let response = format!(
+        concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n",
+            "Content-Length: {}\r\nConnection: close\r\n\r\n{}"
+        ),
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
 
 #[cfg(unix)]
@@ -241,6 +395,7 @@ fn wait_for_file(path: &Path) {
 #[cfg(unix)]
 #[test]
 fn launch_file_infobase_manages_dbgs_and_debuggee_over_rdbg() {
+    let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
     let root = std::env::temp_dir().join(format!("onec-launch-{}", uuid::Uuid::new_v4()));
     let home = root.join("home");
     fs::create_dir_all(home.join(".1cv8/1C/1CEStart")).unwrap();
@@ -313,10 +468,8 @@ while true; do sleep 1; done
         &mut stdin,
         r#"{"seq":4,"type":"request","command":"disconnect","arguments":{}}"#,
     );
-    assert!(
-        read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"")
-            .contains("\"success\":true")
-    );
+    let disconnect = read_dap_message_containing(&mut stdout, "\"command\":\"disconnect\"");
+    assert!(disconnect.contains("\"success\":true"), "{disconnect}");
     drop(stdin);
     assert!(child.wait().unwrap().success());
 
