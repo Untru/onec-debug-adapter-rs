@@ -209,6 +209,11 @@ impl fmt::Display for AttachDebugUiResult {
 #[derive(Debug, Clone)]
 pub struct DebugServer {
     endpoint: String,
+    /// Shares HTTP keep-alive connections between the sequential RDBG control
+    /// requests. Clones intentionally share this pool: the long-poll worker
+    /// may coexist with a control request, but `Adapter::pending_poll` still
+    /// guarantees there is only one physical `pingDebugUI` at a time.
+    agent: ureq::Agent,
 }
 
 impl DebugServer {
@@ -218,6 +223,7 @@ impl DebugServer {
         }
         Ok(Self {
             endpoint: format!("http://{host}:{port}/e1crdbg"),
+            agent: ureq::Agent::new_with_defaults(),
         })
     }
 
@@ -228,7 +234,9 @@ impl DebugServer {
     /// Performs the same low-risk connectivity check used before attaching a UI.
     pub fn test_connection(&self) -> Result<()> {
         let url = format!("{}/rdbgTest?cmd=test", self.endpoint);
-        let response = ureq::post(&url)
+        let response = self
+            .agent
+            .post(&url)
             .header("User-Agent", "1CV8")
             .header("Content-Type", "application/xml")
             .send_empty()
@@ -453,24 +461,28 @@ impl DebugServer {
 
     fn post_xml(&self, command: &str, body: &str) -> Result<String> {
         let url = format!("{}/rdbg?cmd={command}", self.endpoint);
-        let mut response = ureq::post(&url)
+        let response = self
+            .agent
+            .post(&url)
             .header("User-Agent", "1CV8")
             .header("Content-Type", "application/xml; charset=utf-8")
             .send(body)
             .with_context(|| format!("1C debug server request `{command}` failed"))?;
         response
-            .body_mut()
+            .into_body()
             .read_to_string()
             .context("cannot read XML response from 1C debug server")
     }
 
     fn post_empty(&self, url: &str, command: &str) -> Result<String> {
-        let mut response = ureq::post(url)
+        let response = self
+            .agent
+            .post(url)
             .header("User-Agent", "1CV8")
             .send_empty()
             .with_context(|| format!("1C debug server request `{command}` failed"))?;
         response
-            .body_mut()
+            .into_body()
             .read_to_string()
             .context("cannot read XML response from 1C debug server")
     }
@@ -1082,7 +1094,12 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::thread;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn attach_request_contains_escaped_base_request_data() {
@@ -1400,6 +1417,102 @@ mod tests {
                 value: "42".to_owned(),
                 ..DebugVariable::default()
             }])
+        );
+    }
+
+    #[test]
+    fn reuses_one_http_connection_for_sequential_control_requests() {
+        const REQUEST_COUNT: usize = 4;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connection_count = Arc::new(AtomicUsize::new(0));
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let worker_connection_count = Arc::clone(&connection_count);
+        let worker_request_count = Arc::clone(&request_count);
+        let server_thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while worker_request_count.load(Ordering::SeqCst) < REQUEST_COUNT {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for sequential control requests"
+                );
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        worker_connection_count.fetch_add(1, Ordering::SeqCst);
+                        let requests = Arc::clone(&worker_request_count);
+                        thread::spawn(move || {
+                            stream.set_nonblocking(false).unwrap();
+                            let mut stream = stream;
+                            let mut reader = BufReader::new(stream.try_clone().unwrap());
+                            loop {
+                                let mut request_line = String::new();
+                                if reader.read_line(&mut request_line).is_err()
+                                    || request_line.is_empty()
+                                {
+                                    return;
+                                }
+                                let mut content_length = 0;
+                                loop {
+                                    let mut header = String::new();
+                                    reader.read_line(&mut header).unwrap();
+                                    if header == "\r\n" {
+                                        break;
+                                    }
+                                    if let Some((name, value)) = header.split_once(':')
+                                        && name.eq_ignore_ascii_case("Content-Length")
+                                    {
+                                        content_length = value.trim().parse().unwrap();
+                                    }
+                                }
+                                let mut body = vec![0; content_length];
+                                reader.read_exact(&mut body).unwrap();
+                                assert!(request_line.starts_with("POST /e1crdbg/rdbg?cmd="));
+
+                                let body = "<response/>";
+                                write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}",
+                                    body.len(),
+                                    body
+                                )
+                                .unwrap();
+                                stream.flush().unwrap();
+                                if requests.fetch_add(1, Ordering::SeqCst) + 1 == REQUEST_COUNT {
+                                    return;
+                                }
+                            }
+                        });
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("fake RDBG server accept failed: {error}"),
+                }
+            }
+        });
+
+        let server = DebugServer::new("127.0.0.1", port).unwrap();
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        server
+            .set_auto_attach_types(&session, &["Client".to_owned()])
+            .unwrap();
+        server.clear_break_on_next_statement(&session).unwrap();
+        server
+            .attach_debug_targets(&session, &["target-1".to_owned()])
+            .unwrap();
+        server.break_on_next_statement(&session).unwrap();
+
+        server_thread.join().unwrap();
+        assert_eq!(request_count.load(Ordering::SeqCst), REQUEST_COUNT);
+        assert_eq!(
+            connection_count.load(Ordering::SeqCst),
+            1,
+            "sequential control requests should reuse the agent's HTTP connection"
         );
     }
 
