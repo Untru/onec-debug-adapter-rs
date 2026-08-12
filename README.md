@@ -69,5 +69,16 @@ cargo build --release
 
 Файловую базу не нужно добавлять в общий список 1С: для `launch` в `infoBase` можно передать абсолютный путь к каталогу базы или строку `File="/путь/к/базе";`. Адаптер передаст его клиенту через `/F`, поднимет временный `dbgs` и использует обязательный для файловой базы RDBG-alias `DefAlias` автоматически. Это не требует прав администратора и не меняет `ibases.v8i` пользователя.
 
+## Замер задержек отладчика
+
+Чтобы исследовать задержки F10/F11 и загрузки переменных, добавьте в нужную конфигурацию запуска `"trace": true`. По умолчанию адаптер запишет JSONL в `.vscode/onec-debug-latency.jsonl` под `rootProject`; для отдельного пути укажите `traceFile`. Когда `trace` не задан или равен `false`, файл и каталог не создаются.
+
+```json
+"trace": true,
+"traceFile": "/tmp/onec-debug-latency.jsonl"
+```
+
+Каждая строка содержит `schemaVersion`, монотонный `tsMs`, `event` и поля корреляции (`traceId`, `threadId`, `targetId` или `pollId`). В трассе есть DAP-запрос/ответ шага, вызов RDBG, жизненный цикл long-poll, остановка с call stack, а также evaluate/variables и отложенный `exprEvaluated`.
+
 [dap]: https://microsoft.github.io/debug-adapter-protocol/
 [reference]: https://github.com/akpaevj/onec-debug-adapter

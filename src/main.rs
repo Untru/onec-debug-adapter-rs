@@ -13,8 +13,8 @@ use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::fs;
-use std::io::{self, stderr};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufWriter, Write, stderr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
@@ -41,6 +41,9 @@ struct Adapter {
     pending_evaluations: BTreeMap<String, PendingEvaluation>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
+    trace: Option<LatencyTrace>,
+    next_trace_id: u64,
+    pending_steps: BTreeMap<String, u64>,
 }
 
 type DebuggeeLauncher = fn(&ConnectionArguments, &InfoBaseTarget, &DebugServer) -> Result<Child>;
@@ -53,7 +56,70 @@ struct PendingDebuggee {
 /// The only result that crosses from the long-poll worker to the DAP thread.
 /// RDBG values are owned, so no adapter state needs to be shared or locked.
 struct PollResult {
+    poll_id: u64,
+    worker_started_ms: u128,
+    http_completed_ms: Option<u128>,
+    parse_completed_ms: Option<u128>,
     result: std::result::Result<Vec<DebugUiEvent>, String>,
+}
+
+/// JSONL latency trace kept strictly on the DAP thread. Long-poll workers send
+/// timestamps back in `PollResult` instead of sharing this non-Sync writer.
+struct LatencyTrace {
+    started: Instant,
+    writer: BufWriter<File>,
+}
+
+impl LatencyTrace {
+    fn from_arguments(arguments: &ConnectionArguments) -> Result<Option<Self>> {
+        if !arguments.trace {
+            return Ok(None);
+        }
+        let path = match arguments.trace_file.as_deref() {
+            Some(path) if !path.trim().is_empty() => PathBuf::from(path),
+            _ => PathBuf::from(
+                arguments
+                    .root_project
+                    .as_deref()
+                    .context("trace requires traceFile or rootProject")?,
+            )
+            .join(".vscode")
+            .join("onec-debug-latency.jsonl"),
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| {
+                format!("cannot create latency trace directory {}", parent.display())
+            })?;
+        }
+        let writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("cannot open latency trace {}", path.display()))?;
+        Ok(Some(Self {
+            started: Instant::now(),
+            writer: BufWriter::new(writer),
+        }))
+    }
+
+    fn record(&mut self, event_name: &str, fields: Value) {
+        self.record_at(self.started.elapsed().as_millis(), event_name, fields);
+    }
+
+    fn record_at(&mut self, ts_ms: u128, event_name: &str, fields: Value) {
+        let mut record = serde_json::Map::new();
+        record.insert("schemaVersion".to_owned(), json!(1));
+        record.insert("tsMs".to_owned(), json!(ts_ms));
+        record.insert("event".to_owned(), json!(event_name));
+        if let Some(fields) = fields.as_object() {
+            record.extend(fields.clone());
+        }
+        // Tracing is diagnostic-only. A write error must never affect the
+        // debugger or produce output when tracing is disabled.
+        let _ = serde_json::to_writer(&mut self.writer, &record);
+        let _ = self.writer.write_all(b"\n");
+        let _ = self.writer.flush();
+    }
 }
 
 impl Default for Adapter {
@@ -75,6 +141,9 @@ impl Default for Adapter {
             pending_evaluations: BTreeMap::new(),
             module_registry: None,
             module_breakpoints: BTreeMap::new(),
+            trace: None,
+            next_trace_id: 0,
+            pending_steps: BTreeMap::new(),
         }
     }
 }
@@ -100,10 +169,12 @@ enum PendingEvaluation {
         thread_id: i64,
         stack_level: i64,
         path: Vec<CalculationPathItem>,
+        trace_id: u64,
     },
     Variables {
         request: Value,
         reference: VariableReference,
+        trace_id: u64,
     },
 }
 
@@ -144,6 +215,9 @@ struct ConnectionArguments {
     platform_version: Option<String>,
     extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
+    #[serde(default)]
+    trace: bool,
+    trace_file: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -528,6 +602,23 @@ fn extract_connection_property(connection: &str, property: &str) -> Option<Strin
 }
 
 impl Adapter {
+    fn next_trace_id(&mut self) -> u64 {
+        self.next_trace_id += 1;
+        self.next_trace_id
+    }
+
+    fn trace(&mut self, event_name: &str, fields: Value) {
+        if let Some(trace) = &mut self.trace {
+            trace.record(event_name, fields);
+        }
+    }
+
+    fn trace_at(&mut self, ts_ms: u128, event_name: &str, fields: Value) {
+        if let Some(trace) = &mut self.trace {
+            trace.record_at(ts_ms, event_name, fields);
+        }
+    }
+
     fn next_sequence(&mut self) -> u64 {
         self.next_sequence += 1;
         self.next_sequence
@@ -621,6 +712,7 @@ impl Adapter {
         let arguments: ConnectionArguments =
             serde_json::from_value(request["arguments"].clone())
                 .context("launch/attach requires debugServerHost and debugServerPort")?;
+        let trace = LatencyTrace::from_arguments(&arguments)?;
         let module_registry = match arguments.root_project.as_deref() {
             Some(root_project) => {
                 let extensions = arguments
@@ -638,6 +730,7 @@ impl Adapter {
             None => None,
         };
         let info_base = info_base_target(&arguments)?;
+        let trace_info_base = info_base.alias.clone();
         let mut spawned_debug_server = if launch && info_base.is_file {
             let platform_path = arguments
                 .platform_path
@@ -694,6 +787,17 @@ impl Adapter {
         self.poll_failed = false;
         self.module_registry = module_registry;
         self.module_breakpoints.clear();
+        self.trace = trace;
+        self.next_trace_id = 0;
+        self.pending_steps.clear();
+        self.trace(
+            "session.started",
+            json!({
+                "request": if launch { "launch" } else { "attach" },
+                "infoBase": trace_info_base,
+                "rdbgEndpoint": self.debug_server.as_ref().map(DebugServer::endpoint),
+            }),
+        );
         Ok(())
     }
 
@@ -742,10 +846,24 @@ impl Adapter {
         self.pending_evaluations.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
+        self.pending_steps.clear();
+        self.trace("session.ended", json!({}));
+        self.trace = None;
         detach_result
     }
 
     fn step(&mut self, request: &Value, action: StepAction) -> Vec<Value> {
+        let trace_id = self.next_trace_id();
+        self.trace(
+            "dap.step.received",
+            json!({
+                "traceId": trace_id,
+                "requestSeq": request["seq"],
+                "command": request["command"],
+                "threadId": request["arguments"]["threadId"],
+                "action": format!("{action:?}"),
+            }),
+        );
         let thread_id = match request["arguments"]["threadId"].as_i64() {
             Some(thread_id) => thread_id,
             None => {
@@ -766,7 +884,8 @@ impl Adapter {
                 )];
             }
         };
-        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+        let (Some(server), Some(session)) = (self.debug_server.clone(), self.debug_session.clone())
+        else {
             return vec![error_response(
                 request,
                 self.next_sequence(),
@@ -774,13 +893,26 @@ impl Adapter {
             )];
         };
 
-        if let Err(error) = server.step(session, &target_id, action) {
+        self.trace(
+            "rdbg.step.started",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id }),
+        );
+        if let Err(error) = server.step(&session, &target_id, action) {
+            self.trace(
+                "rdbg.step.response",
+                json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "success": false, "error": error.to_string() }),
+            );
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 error.to_string(),
             )];
         }
+        self.trace(
+            "rdbg.step.response",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "success": true }),
+        );
+        self.pending_steps.insert(target_id.clone(), trace_id);
 
         let all_threads_continued = request["arguments"]["singleThread"] != Value::Bool(true);
         let body = if action == StepAction::Continue {
@@ -789,6 +921,10 @@ impl Adapter {
             json!({})
         };
         let mut messages = vec![response(request, self.next_sequence(), body)];
+        self.trace(
+            "dap.step.response",
+            json!({ "traceId": trace_id, "requestSeq": request["seq"], "threadId": thread_id }),
+        );
         // All four resume commands make the target run. VS Code relies on
         // this notification to clear its stopped state after F10/F11 too.
         messages.push(event(
@@ -796,6 +932,10 @@ impl Adapter {
             "continued",
             json!({ "threadId": thread_id, "allThreadsContinued": all_threads_continued }),
         ));
+        self.trace(
+            "dap.step.continued",
+            json!({ "traceId": trace_id, "threadId": thread_id, "allThreadsContinued": all_threads_continued }),
+        );
         messages
     }
 
@@ -1172,6 +1312,10 @@ impl Adapter {
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.pending_poll = None;
                     Some(PollResult {
+                        poll_id: 0,
+                        worker_started_ms: 0,
+                        http_completed_ms: None,
+                        parse_completed_ms: None,
                         result: Err("1C debug server poll worker exited unexpectedly".to_owned()),
                     })
                 }
@@ -1189,18 +1333,69 @@ impl Adapter {
         };
         let server = server.clone();
         let session = session.clone();
+        let poll_id = if self.trace.is_some() {
+            self.next_trace_id()
+        } else {
+            0
+        };
+        let trace_started = self.trace.as_ref().map(|trace| trace.started);
+        if poll_id != 0 {
+            self.trace("rdbg.poll.worker_spawned", json!({ "pollId": poll_id }));
+        }
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let result = server
-                .ping_debug_ui(&session)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(PollResult { result });
+            let worker_started_ms = trace_started
+                .map(|started| started.elapsed().as_millis())
+                .unwrap_or(0);
+            let result = server.ping_debug_ui_timed(&session);
+            let (http_completed_ms, parse_completed_ms, result) = match result {
+                Ok(result) => {
+                    let http_completed_ms = trace_started
+                        .map(|_| worker_started_ms + result.timings.http_elapsed.as_millis());
+                    let parse_completed_ms = trace_started.map(|_| {
+                        worker_started_ms
+                            + result.timings.http_elapsed.as_millis()
+                            + result.timings.parse_elapsed.as_millis()
+                    });
+                    (http_completed_ms, parse_completed_ms, Ok(result.events))
+                }
+                Err(error) => (None, None, Err(error.to_string())),
+            };
+            let _ = sender.send(PollResult {
+                poll_id,
+                worker_started_ms,
+                http_completed_ms,
+                parse_completed_ms,
+                result,
+            });
         });
         self.pending_poll = Some(receiver);
         Vec::new()
     }
 
     fn handle_poll_result(&mut self, completed: PollResult) -> Vec<Value> {
+        if completed.poll_id != 0 {
+            self.trace_at(
+                completed.worker_started_ms,
+                "rdbg.poll.worker_started",
+                json!({ "pollId": completed.poll_id }),
+            );
+            if let Some(http_completed_ms) = completed.http_completed_ms {
+                self.trace_at(
+                    http_completed_ms,
+                    "rdbg.poll.http_completed",
+                    json!({ "pollId": completed.poll_id }),
+                );
+            }
+            if let Some(parse_completed_ms) = completed.parse_completed_ms {
+                self.trace_at(
+                    parse_completed_ms,
+                    "rdbg.poll.parse_completed",
+                    json!({ "pollId": completed.poll_id }),
+                );
+            }
+            self.trace("rdbg.poll.received", json!({ "pollId": completed.poll_id }));
+        }
         match completed.result {
             Ok(events) => {
                 self.poll_failed = false;
@@ -1335,12 +1530,27 @@ impl Adapter {
         stack.reverse();
         self.call_stacks.insert(thread_id, stack);
         self.clear_thread_references(thread_id);
+        self.trace(
+            "rdbg.call_stack.received",
+            json!({ "targetId": target_id, "threadId": thread_id }),
+        );
         let reason = stopped_reason.unwrap_or(
             if debug_event.stopped_by_breakpoint || debug_event.suspended_by_other {
                 "breakpoint"
             } else {
                 "step"
             },
+        );
+        let step_trace_id = self.pending_steps.remove(&target_id);
+        self.trace(
+            "dap.stopped.emitted",
+            json!({
+                "traceId": step_trace_id,
+                "targetId": target_id,
+                "threadId": thread_id,
+                "reason": reason,
+                "frames": self.call_stacks.get(&thread_id).map_or(0, Vec::len),
+            }),
         );
         messages.push(event(
             self.next_sequence(),
@@ -1411,6 +1621,7 @@ impl Adapter {
     }
 
     fn evaluate(&mut self, request: &Value) -> Vec<Value> {
+        let trace_id = self.next_trace_id();
         let expression = match request["arguments"]["expression"].as_str() {
             Some(expression) if !expression.trim().is_empty() => expression,
             _ => {
@@ -1442,32 +1653,66 @@ impl Adapter {
                 )];
             }
         };
-        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+        self.trace(
+            "dap.evaluate.received",
+            json!({
+                "traceId": trace_id,
+                "requestSeq": request["seq"],
+                "threadId": thread_id,
+                "stackLevel": stack_level,
+                "targetId": target_id,
+            }),
+        );
+        let (Some(server), Some(session)) = (self.debug_server.clone(), self.debug_session.clone())
+        else {
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 "no 1C debug session is attached",
             )];
         };
-        let started =
-            match server.begin_evaluate_expression(session, &target_id, stack_level, expression) {
-                Ok(started) => started,
-                Err(error) => {
-                    return vec![error_response(
-                        request,
-                        self.next_sequence(),
-                        error.to_string(),
-                    )];
-                }
-            };
+        self.trace(
+            "rdbg.evaluate.started",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "stackLevel": stack_level }),
+        );
+        let started = match server.begin_evaluate_expression(
+            &session,
+            &target_id,
+            stack_level,
+            expression,
+        ) {
+            Ok(started) => started,
+            Err(error) => {
+                self.trace(
+                        "rdbg.evaluate.response",
+                        json!({ "traceId": trace_id, "targetId": target_id, "success": false, "error": error.to_string() }),
+                    );
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    error.to_string(),
+                )];
+            }
+        };
+        self.trace(
+            "rdbg.evaluate.response",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "deferred": started.result.is_none(), "resultId": started.result_id }),
+        );
         match started.result {
-            Some(evaluation) => self.evaluation_response(
-                request,
-                thread_id,
-                stack_level,
-                vec![CalculationPathItem::Expression(expression.to_owned())],
-                evaluation,
-            ),
+            Some(evaluation) => {
+                let response = self.evaluation_response(
+                    request,
+                    thread_id,
+                    stack_level,
+                    vec![CalculationPathItem::Expression(expression.to_owned())],
+                    evaluation,
+                );
+                self.trace(
+                    "dap.evaluate.response",
+                    json!({ "traceId": trace_id, "requestSeq": request["seq"], "threadId": thread_id }),
+                );
+                response
+            }
             None => {
                 self.pending_evaluations.insert(
                     started.result_id,
@@ -1476,6 +1721,7 @@ impl Adapter {
                         thread_id,
                         stack_level,
                         path: vec![CalculationPathItem::Expression(expression.to_owned())],
+                        trace_id,
                     },
                 );
                 Vec::new()
@@ -1516,6 +1762,7 @@ impl Adapter {
     }
 
     fn variables(&mut self, request: &Value) -> Vec<Value> {
+        let trace_id = self.next_trace_id();
         let reference = match request["arguments"]["variablesReference"]
             .as_i64()
             .and_then(|id| self.variable_references.get(&id).cloned())
@@ -1540,21 +1787,37 @@ impl Adapter {
                 )];
             }
         };
-        let (Some(server), Some(session)) = (&self.debug_server, &self.debug_session) else {
+        self.trace(
+            "dap.variables.received",
+            json!({
+                "traceId": trace_id,
+                "requestSeq": request["seq"],
+                "threadId": thread_id,
+                "stackLevel": stack_level,
+                "targetId": target_id,
+                "variablesReference": request["arguments"]["variablesReference"],
+            }),
+        );
+        let (Some(server), Some(session)) = (self.debug_server.clone(), self.debug_session.clone())
+        else {
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 "no 1C debug session is attached",
             )];
         };
+        self.trace(
+            "rdbg.evaluate.started",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "stackLevel": stack_level, "kind": "variables" }),
+        );
         let started = match &reference {
             VariableReference::Locals { .. } => {
-                server.begin_evaluate_local_variables(session, &target_id, stack_level)
+                server.begin_evaluate_local_variables(&session, &target_id, stack_level)
             }
             VariableReference::Value {
                 path, interface, ..
             } => server
-                .begin_evaluate_path(session, &target_id, stack_level, path, *interface)
+                .begin_evaluate_path(&session, &target_id, stack_level, path, *interface)
                 .map(|started| debug_server::EvaluationStart {
                     result_id: started.result_id,
                     result: started.result.map(|evaluation| evaluation.variables),
@@ -1563,6 +1826,10 @@ impl Adapter {
         let started = match started {
             Ok(started) => started,
             Err(error) => {
+                self.trace(
+                    "rdbg.evaluate.response",
+                    json!({ "traceId": trace_id, "targetId": target_id, "success": false, "error": error.to_string(), "kind": "variables" }),
+                );
                 return vec![error_response(
                     request,
                     self.next_sequence(),
@@ -1570,14 +1837,26 @@ impl Adapter {
                 )];
             }
         };
+        self.trace(
+            "rdbg.evaluate.response",
+            json!({ "traceId": trace_id, "targetId": target_id, "threadId": thread_id, "deferred": started.result.is_none(), "resultId": started.result_id, "kind": "variables" }),
+        );
         match started.result {
-            Some(variables) => self.variables_response(request, &reference, variables),
+            Some(variables) => {
+                let response = self.variables_response(request, &reference, variables);
+                self.trace(
+                    "dap.variables.response",
+                    json!({ "traceId": trace_id, "requestSeq": request["seq"], "threadId": thread_id }),
+                );
+                response
+            }
             None => {
                 self.pending_evaluations.insert(
                     started.result_id,
                     PendingEvaluation::Variables {
                         request: request.clone(),
                         reference,
+                        trace_id,
                     },
                 );
                 Vec::new()
@@ -1607,9 +1886,36 @@ impl Adapter {
                 thread_id,
                 stack_level,
                 path,
-            } => self.evaluation_response(&request, thread_id, stack_level, path, evaluation),
-            PendingEvaluation::Variables { request, reference } => {
-                self.variables_response(&request, &reference, evaluation.variables)
+                trace_id,
+            } => {
+                self.trace(
+                    "rdbg.expr_evaluated.received",
+                    json!({ "traceId": trace_id, "resultId": evaluation.result_id, "threadId": thread_id, "kind": "evaluate" }),
+                );
+                let response =
+                    self.evaluation_response(&request, thread_id, stack_level, path, evaluation);
+                self.trace(
+                    "dap.evaluate.response",
+                    json!({ "traceId": trace_id, "requestSeq": request["seq"], "threadId": thread_id, "deferred": true }),
+                );
+                response
+            }
+            PendingEvaluation::Variables {
+                request,
+                reference,
+                trace_id,
+            } => {
+                let (thread_id, _) = reference.address();
+                self.trace(
+                    "rdbg.expr_evaluated.received",
+                    json!({ "traceId": trace_id, "resultId": evaluation.result_id, "threadId": thread_id, "kind": "variables" }),
+                );
+                let response = self.variables_response(&request, &reference, evaluation.variables);
+                self.trace(
+                    "dap.variables.response",
+                    json!({ "traceId": trace_id, "requestSeq": request["seq"], "threadId": thread_id, "deferred": true }),
+                );
+                response
             }
         }
     }
@@ -1916,6 +2222,8 @@ mod tests {
                     platform_version: None,
                     extensions: None,
                     auto_attach_types: None,
+                    trace: false,
+                    trace_file: None,
                 },
                 info_base: InfoBaseTarget {
                     alias: "Demo".to_owned(),
@@ -2025,6 +2333,7 @@ mod tests {
                 thread_id: 7,
                 stack_level: 0,
                 path: vec![CalculationPathItem::Expression("Counter".to_owned())],
+                trace_id: 1,
             },
         );
 
@@ -2240,6 +2549,8 @@ Connect=File="/tmp/demo";
             platform_version: None,
             extensions: None,
             auto_attach_types: None,
+            trace: false,
+            trace_file: None,
         };
         assert_eq!(
             info_base_target(&arguments).unwrap(),
@@ -2250,6 +2561,41 @@ Connect=File="/tmp/demo";
             }
         );
 
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn latency_trace_is_opt_in_and_writes_jsonl_lifecycle_records() {
+        let directory = std::env::temp_dir().join(format!("onec-latency-{}", uuid::Uuid::new_v4()));
+        let trace_file = directory.join("trace.jsonl");
+        let disabled = ConnectionArguments {
+            debug_server_host: "localhost".to_owned(),
+            debug_server_port: 1550,
+            info_base: Some("Demo".to_owned()),
+            info_base_alias: None,
+            root_project: None,
+            platform_path: None,
+            platform_version: None,
+            extensions: None,
+            auto_attach_types: None,
+            trace: false,
+            trace_file: Some(trace_file.to_string_lossy().into_owned()),
+        };
+        assert!(LatencyTrace::from_arguments(&disabled).unwrap().is_none());
+        assert!(!directory.exists());
+
+        let enabled = ConnectionArguments {
+            trace: true,
+            ..disabled
+        };
+        let mut trace = LatencyTrace::from_arguments(&enabled).unwrap().unwrap();
+        trace.record("dap.step.received", json!({ "traceId": 7, "threadId": 1 }));
+        drop(trace);
+        let record: Value =
+            serde_json::from_str(&fs::read_to_string(&trace_file).unwrap()).unwrap();
+        assert_eq!(record["event"], "dap.step.received");
+        assert_eq!(record["traceId"], 7);
+        assert_eq!(record["schemaVersion"], 1);
         fs::remove_dir_all(directory).unwrap();
     }
 

@@ -105,6 +105,9 @@ fn adapter_detaches_debug_ui_when_dap_input_closes() {
 fn pending_rdbg_poll_does_not_delay_step_in_request() {
     let _lock = RDBG_PROCESS_TEST_LOCK.lock().unwrap();
     let rdbg = FakeRdbgServer::start_with_held_pings(true);
+    let trace_file =
+        std::env::temp_dir().join(format!("onec-latency-{}.jsonl", uuid::Uuid::new_v4()));
+    let trace_path = trace_file.to_string_lossy();
     let mut child = Command::new(env!("CARGO_BIN_EXE_onec-debug-adapter"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -121,8 +124,8 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
     send_dap_request(
         &mut stdin,
         &format!(
-            r#"{{"seq":2,"type":"request","command":"attach","arguments":{{"infoBaseAlias":"Probe","debugServerHost":"127.0.0.1","debugServerPort":{}}}}}"#,
-            rdbg.port
+            r#"{{"seq":2,"type":"request","command":"attach","arguments":{{"infoBaseAlias":"Probe","debugServerHost":"127.0.0.1","debugServerPort":{},"trace":true,"traceFile":{:?}}}}}"#,
+            rdbg.port, trace_path
         ),
     );
     assert!(read_dap_message(&mut stdout).contains("\"command\":\"attach\""));
@@ -169,6 +172,11 @@ fn pending_rdbg_poll_does_not_delay_step_in_request() {
     );
     drop(stdin);
     assert!(child.wait().unwrap().success());
+    let trace = fs::read_to_string(&trace_file).unwrap();
+    assert!(trace.contains("\"event\":\"dap.step.received\""));
+    assert!(trace.contains("\"event\":\"rdbg.step.response\""));
+    assert!(trace.contains("\"event\":\"rdbg.poll.worker_spawned\""));
+    fs::remove_file(trace_file).unwrap();
     rdbg.shutdown();
 }
 

@@ -8,6 +8,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::fmt;
+use std::time::Duration;
+use std::time::Instant;
 use uuid::Uuid;
 
 const RDBG_REQUEST_NAMESPACE: &str = "http://v8.1c.ru/8.3/debugger/debugRDBGRequestResponse";
@@ -103,6 +105,19 @@ pub enum EvaluationInterface {
 pub struct EvaluationStart<T> {
     pub result_id: String,
     pub result: Option<T>,
+}
+
+/// Timing information for one RDBG long-poll. The adapter owns the trace
+/// writer, so this small, owned value can safely cross back from its worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PingTimings {
+    pub http_elapsed: Duration,
+    pub parse_elapsed: Duration,
+}
+
+pub struct PingResult {
+    pub events: Vec<DebugUiEvent>,
+    pub timings: PingTimings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,16 +300,26 @@ impl DebugServer {
         parse_debug_targets(&response)
     }
 
-    /// Fetches pending Debug UI commands. The caller is responsible for
-    /// translating these commands to DAP events.
-    pub fn ping_debug_ui(&self, session: &DebugUiSession) -> Result<Vec<DebugUiEvent>> {
+    /// Fetches pending Debug UI commands and separates network wait from XML
+    /// parsing so latency traces can identify the source of a slow step.
+    pub fn ping_debug_ui_timed(&self, session: &DebugUiSession) -> Result<PingResult> {
         let url = format!(
             "{}/rdbg?cmd=pingDebugUIParams&dbgui={}",
             self.endpoint,
             session.id()
         );
+        let http_started = Instant::now();
         let response = self.post_empty(&url, "pingDebugUIParams")?;
-        parse_debug_ui_events(&response)
+        let http_elapsed = http_started.elapsed();
+        let parse_started = Instant::now();
+        let events = parse_debug_ui_events(&response)?;
+        Ok(PingResult {
+            events,
+            timings: PingTimings {
+                http_elapsed,
+                parse_elapsed: parse_started.elapsed(),
+            },
+        })
     }
 
     /// Attaches the Debug UI to the supplied execution contexts.
@@ -1446,7 +1471,7 @@ mod tests {
             }]
         );
         assert_eq!(
-            server.ping_debug_ui(&session).unwrap(),
+            server.ping_debug_ui_timed(&session).unwrap().events,
             vec![DebugUiEvent {
                 command_id: "targetStarted".to_owned(),
                 target_id: Some("target-1".to_owned()),

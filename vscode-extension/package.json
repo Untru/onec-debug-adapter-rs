@@ -143,6 +143,15 @@
                     "MobileManagedServer"
                   ]
                 }
+              },
+              "trace": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write an opt-in JSONL latency trace for debugger requests"
+              },
+              "traceFile": {
+                "type": "string",
+                "description": "Optional JSONL latency trace path; defaults to .vscode/onec-debug-latency.jsonl under rootProject"
               }
             }
           },
@@ -191,6 +200,15 @@
                 "items": {
                   "type": "string"
                 }
+              },
+              "trace": {
+                "type": "boolean",
+                "default": false,
+                "description": "Write an opt-in JSONL latency trace for debugger requests"
+              },
+              "traceFile": {
+                "type": "string",
+                "description": "Optional JSONL latency trace path; defaults to .vscode/onec-debug-latency.jsonl under rootProject"
               }
             }
           }
