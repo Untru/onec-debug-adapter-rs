@@ -17,7 +17,7 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "onDebug:onec"
+    "onDebug"
   ],
   "contributes": {
     "configuration": {

@@ -8,7 +8,7 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
 
 ## Installing a release VSIX
 
-1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases). The current published prerelease is `v0.1.0-alpha.21`.
+1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases). The current published prerelease is `v0.1.0-alpha.23`.
 2. In VS Code, open **Extensions** → `…` → **Install from VSIX…**, or run:
 
    ```sh

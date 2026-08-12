@@ -31,7 +31,7 @@ cargo build --release
 
 ## Установка VSIX
 
-1. На странице [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases) скачайте файл `onec-debug-native-<target>.vsix` для своей ОС и архитектуры. Текущий опубликованный prerelease — `v0.1.0-alpha.21`.
+1. На странице [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases) скачайте файл `onec-debug-native-<target>.vsix` для своей ОС и архитектуры. Текущий опубликованный prerelease — `v0.1.0-alpha.23`.
 2. В VS Code откройте **Extensions**, нажмите `…` и выберите **Install from VSIX…**. Либо выполните:
 
    ```sh
