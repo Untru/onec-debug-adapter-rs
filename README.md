@@ -29,6 +29,36 @@ cargo build --release
 
 При публикации тега `v*` GitHub Actions собирает нативные VSIX для Windows x64, Linux x64/ARM64 и macOS x64/Apple Silicon. В каждом VSIX находится только подходящий бинарник адаптера; устанавливать .NET, Rust или Node.js пользователю не нужно.
 
+## Установка VSIX
+
+1. На странице [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases) скачайте файл `onec-debug-native-<target>.vsix` для своей ОС и архитектуры. Текущий опубликованный prerelease — `v0.1.0-alpha.21`.
+2. В VS Code откройте **Extensions**, нажмите `…` и выберите **Install from VSIX…**. Либо выполните:
+
+   ```sh
+   code --install-extension onec-debug-native-<target>.vsix
+   ```
+
+3. Создайте `.vscode/launch.json`, например:
+
+   ```json
+   {
+     "version": "0.2.0",
+     "configurations": [
+       {
+         "name": "1C: Launch",
+         "type": "onec",
+         "request": "launch",
+         "rootProject": "/absolute/path/to/unpacked-configuration",
+         "platformPath": "/absolute/path/to/1c-platform-versions",
+         "platformVersion": "LATEST",
+         "infoBase": "/absolute/path/to/file-infobase"
+       }
+     ]
+   }
+   ```
+
+Не устанавливайте одновременно это расширение и оригинальный `vsc-onec-debug-adapter`: оба регистрируют `type: "onec"`.
+
 ## Совместимость с VS Code
 
 Расширение регистрирует тот же тип отладчика — `"type": "onec"`, — что и [akpaevj/vsc-onec-debug-adapter](https://github.com/akpaevj/vsc-onec-debug-adapter). Поэтому конфигурации сохраняют `rootProject`, `platformPath`, `platformVersion`, `infoBase`, `debugServerHost`, `debugServerPort`, `extensions` и `autoAttachTypes`; меняется только установленное расширение. Вместо `dotnet` оно запускает подходящий для ОС нативный бинарник из VSIX.
