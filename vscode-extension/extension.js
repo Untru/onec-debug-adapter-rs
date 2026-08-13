@@ -15,6 +15,8 @@ const {
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseServerInfoBaseConnection,
+  serverInfoBaseConnection,
   uniqueConfigurationName,
   isPlatformVersionDirectory,
   validatePlatformDirectory
@@ -405,27 +407,21 @@ async function chooseExtensionsFromInfoBase(workspaceFolder, baseProject, extens
 }
 
 async function chooseRequest(selectedInfoBase) {
-  const serverProjectBase = selectedInfoBase?.requiresRegisteredLaunch === true;
   const selected = await vscode.window.showQuickPick(
     [
-      ...(serverProjectBase ? [] : [{
+      {
         label: "Запуск 1С",
         description: "Запустить клиент 1С и подключить отладчик",
         request: "launch"
-      }]),
+      },
       {
         label: "Подключение к отладчику",
-        description: serverProjectBase
-          ? "Для серверной базы из .v8-project.json; запуск требует регистрации в списке 1С"
-          : "Подключиться к уже доступному серверу отладки",
+        description: "Подключиться к уже доступному серверу отладки",
         request: "attach"
       }
     ],
     {
-      title: "1C: Режим отладки",
-      placeHolder: serverProjectBase
-        ? "Для запуска выберите эту базу из реестра 1С или добавьте её в список запуска"
-        : undefined
+      title: "1C: Режим отладки"
     }
   );
   return selected?.request;
@@ -548,8 +544,8 @@ async function chooseInfoBase(workspaceFolder) {
           browse: true
         },
         {
-          label: "$(edit) Ввести имя зарегистрированной базы…",
-          description: "Без строки подключения и учётных данных",
+          label: "$(edit) Ввести серверное подключение…",
+          description: "Формат: Srvr=\"server\";Ref=\"base\"; без учётных данных",
           manual: true
         }
       ],
@@ -579,42 +575,46 @@ async function chooseInfoBase(workspaceFolder) {
       continue;
     }
     if (selected.entry) {
-      if (selected.entry.source === "v8-project" && selected.entry.kind === "file") {
+      if (selected.entry.kind === "file" && selected.entry.filePath) {
         return {
           infoBase: selected.entry.filePath,
           inventoryConnection: { kind: "file", value: selected.entry.filePath },
           supportsStandaloneServer: true
         };
       }
-      if (selected.entry.source === "v8-project" && selected.entry.kind === "server") {
+      if (selected.entry.kind === "server" && selected.entry.server && selected.entry.reference) {
         const connection = `${selected.entry.server}\\${selected.entry.reference}`;
         return {
-          // A direct debug-server alias is sufficient for attach. Launch still
-          // needs a 1C-launcher registration until native /S startup exists.
-          infoBase: connection,
+          infoBase: serverInfoBaseConnection(selected.entry.server, selected.entry.reference),
           infoBaseAlias: selected.entry.reference,
           inventoryConnection: { kind: "server", value: connection },
-          requiresRegisteredLaunch: true
+          supportsStandaloneServer: false
         };
       }
-      // Keep a launcher registration by name even for a file base: a stored
-      // password must never be copied into launch.json or shown by the wizard.
-      return {
-        infoBase: selected.entry.name,
-        inventoryConnection: { kind: "registered", value: selected.entry.name },
-        supportsStandaloneServer: selected.entry.kind === "file"
-      };
+      await vscode.window.showErrorMessage(
+        "У выбранной записи нет файлового пути или пары Srvr/Ref; её нельзя записать в launch.json без имени регистрации."
+      );
+      continue;
     }
     if (selected.manual) {
       const infoBase = await inputInfoBase(
-        "1C: Имя зарегистрированной базы",
-        "Введите только имя базы, без строки подключения и пароля"
+        "1C: Серверное подключение",
+        "Введите Srvr=\"server\";Ref=\"base\"; без логина и пароля"
       );
-      return infoBase ? {
-        infoBase,
-        inventoryConnection: { kind: "registered", value: infoBase },
+      if (!infoBase) return undefined;
+      const server = parseServerInfoBaseConnection(infoBase);
+      if (!server) {
+        await vscode.window.showErrorMessage(
+          "Нужно указать оба параметра: Srvr=\"server\";Ref=\"base\";."
+        );
+        continue;
+      }
+      return {
+        infoBase: serverInfoBaseConnection(server.server, server.reference),
+        infoBaseAlias: server.reference,
+        inventoryConnection: { kind: "server", value: `${server.server}\\${server.reference}` },
         supportsStandaloneServer: false
-      } : undefined;
+      };
     }
     const directory = (await pickDirectory("1C: Каталог файловой информационной базы", workspaceFolder.uri))?.[0];
     if (!directory) continue;

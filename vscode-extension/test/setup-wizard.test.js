@@ -20,8 +20,10 @@ const {
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseServerInfoBaseConnection,
   parseIbaseV8i,
   parseV8Project,
+  serverInfoBaseConnection,
   uniqueConfigurationName,
   validatePlatformDirectory
 } = require("../setup-wizard");
@@ -88,6 +90,16 @@ test("summarizes the standalone server launch mode", () => {
 test("recognizes credential-bearing connection strings", () => {
   assert.equal(hasCredentials('File="/tmp/ib";Pwd="secret";'), true);
   assert.equal(hasCredentials("DemoBase"), false);
+});
+
+test("converts a selected server base to a credential-free direct connection", () => {
+  const connection = serverInfoBaseConnection("srv-1c", "Accounting");
+  assert.equal(connection, 'Srvr="srv-1c";Ref="Accounting";');
+  assert.deepEqual(parseServerInfoBaseConnection(connection), {
+    server: "srv-1c",
+    reference: "Accounting"
+  });
+  assert.equal(parseServerInfoBaseConnection('Srvr="srv-1c";'), undefined);
 });
 
 test("parses safe file and server entries from ibases.v8i", () => {

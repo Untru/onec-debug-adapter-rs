@@ -175,7 +175,7 @@
               },
               "infoBase": {
                 "type": "string",
-                "description": "1C infobase name or alias"
+                "description": "Absolute file-infobase directory or a server connection Srvr=\"server\";Ref=\"base\";"
               },
               "infoBaseAlias": {
                 "type": "string",
@@ -258,7 +258,7 @@
               },
               "infoBase": {
                 "type": "string",
-                "description": "1C infobase name or alias"
+                "description": "Absolute file-infobase directory or a server connection Srvr=\"server\";Ref=\"base\";"
               },
               "infoBaseAlias": {
                 "type": "string",

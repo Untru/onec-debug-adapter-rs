@@ -41,6 +41,17 @@ function connectionProperty(connection, property) {
   return undefined;
 }
 
+function serverInfoBaseConnection(server, reference) {
+  const quote = (value) => String(value).replace(/"/g, '""');
+  return `Srvr="${quote(server)}";Ref="${quote(reference)}";`;
+}
+
+function parseServerInfoBaseConnection(connection) {
+  const server = connectionProperty(connection, "Srvr");
+  const reference = connectionProperty(connection, "Ref");
+  return server && reference ? { server, reference } : undefined;
+}
+
 function parseIbaseV8i(contents) {
   if (typeof contents !== "string") return [];
   const entries = [];
@@ -57,8 +68,9 @@ function parseIbaseV8i(contents) {
       filePath,
       server,
       reference,
-      // This is only a UI hint.  No user name, password or connection string
-      // leaves this parser; launch.json will contain the registration name.
+      // This is only a UI hint. No user name, password or original connection
+      // string leaves this parser; the wizard reconstructs a safe File or
+      // Srvr/Ref identity for launch.json.
       hasStoredCredentials: hasCredentials(connect)
     });
   };
@@ -502,8 +514,10 @@ module.exports = {
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseServerInfoBaseConnection,
   parseIbaseV8i,
   parseV8Project,
+  serverInfoBaseConnection,
   platformBinaryDirectory,
   platformExecutables,
   readPlatformText,

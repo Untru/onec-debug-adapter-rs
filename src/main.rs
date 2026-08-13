@@ -280,6 +280,16 @@ struct InfoBaseTarget {
     /// still starts registered bases via `/IBName`, while `ibsrv` needs the
     /// concrete directory passed to `--database-path`.
     registered_file_path: Option<PathBuf>,
+    /// A server connection supplied directly as `Srvr="host";Ref="base";`
+    /// or resolved from the launcher registration. It lets launch use `/S`
+    /// without relying on the mutable per-user launcher list.
+    direct_server: Option<ServerInfoBase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerInfoBase {
+    server: String,
+    reference: String,
 }
 
 const FILE_INFOBASE_ALIAS: &str = "DefAlias";
@@ -337,6 +347,8 @@ fn launch_debuggee(
         }
     } else if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
+    } else if let Some(server) = &info_base_target.direct_server {
+        command.arg(direct_server_connection(server));
     } else {
         command.args([
             "/IBName",
@@ -436,6 +448,10 @@ fn standalone_server_direct_connection(arguments: &ConnectionArguments) -> Strin
         "/S{host}:{registration_port}\\{}",
         standalone_server_name(arguments)
     )
+}
+
+fn direct_server_connection(server: &ServerInfoBase) -> String {
+    format!("/S{}\\{}", server.server, server.reference)
 }
 
 fn launch_standalone_server(
@@ -718,8 +734,8 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
         .or(arguments.info_base_alias.as_deref())
         .context("launch/attach requires infoBase or infoBaseAlias")?;
     let direct_file_path = direct_file_infobase_path(info_base);
-    let launcher_target = direct_file_path
-        .is_none()
+    let direct_server = direct_server_infobase(info_base);
+    let launcher_target = (direct_file_path.is_none() && direct_server.is_none())
         .then(|| launcher_info_base_from_paths(&ibases_paths(), info_base))
         .flatten();
     let is_file = direct_file_path.is_some()
@@ -734,14 +750,26 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
+            .or_else(|| {
+                direct_server
+                    .as_ref()
+                    .map(|target| target.reference.clone())
+            })
             .or_else(|| launcher_target.as_ref().map(|target| target.alias.clone()))
             .unwrap_or_else(|| info_base.to_owned())
     };
+    let registered_file_path = launcher_target
+        .as_ref()
+        .and_then(|target| target.registered_file_path.clone());
+    let launcher_direct_server = launcher_target
+        .as_ref()
+        .and_then(|target| target.direct_server.clone());
     Ok(InfoBaseTarget {
         alias,
         is_file,
         direct_file_path,
-        registered_file_path: launcher_target.and_then(|target| target.registered_file_path),
+        registered_file_path,
+        direct_server: direct_server.or(launcher_direct_server),
     })
 }
 
@@ -949,13 +977,15 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
                 is_file: true,
                 direct_file_path: None,
                 registered_file_path,
+                direct_server: None,
             });
         }
-        return extract_connection_property(connect, "Ref").map(|alias| InfoBaseTarget {
-            alias,
+        return direct_server_infobase(connect).map(|server| InfoBaseTarget {
+            alias: server.reference.clone(),
             is_file: false,
             direct_file_path: None,
             registered_file_path: None,
+            direct_server: Some(server),
         });
     }
     None
@@ -969,6 +999,12 @@ fn direct_file_infobase_path(info_base: &str) -> Option<PathBuf> {
             path.is_dir().then_some(path)
         })?;
     path.is_dir().then_some(path)
+}
+
+fn direct_server_infobase(info_base: &str) -> Option<ServerInfoBase> {
+    let server = extract_connection_property(info_base, "Srvr")?;
+    let reference = extract_connection_property(info_base, "Ref")?;
+    (!server.is_empty() && !reference.is_empty()).then_some(ServerInfoBase { server, reference })
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -2660,6 +2696,7 @@ mod tests {
                     is_file: false,
                     direct_file_path: None,
                     registered_file_path: None,
+                    direct_server: None,
                 },
             }),
             ..Default::default()
@@ -2944,6 +2981,7 @@ Connect=File="/tmp/demo";
                 is_file: true,
                 direct_file_path: None,
                 registered_file_path: Some(PathBuf::from("/tmp/demo")),
+                direct_server: None,
             })
         );
         assert_eq!(
@@ -2953,6 +2991,10 @@ Connect=File="/tmp/demo";
                 is_file: false,
                 direct_file_path: None,
                 registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "localhost".to_owned(),
+                    reference: "Accounting".to_owned(),
+                }),
             })
         );
         assert_eq!(launcher_info_base(ibases, "Missing"), None);
@@ -3123,6 +3165,10 @@ Connect=File="/tmp/demo";
                 is_file: false,
                 direct_file_path: None,
                 registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "localhost".to_owned(),
+                    reference: "Service".to_owned(),
+                }),
             })
         );
         assert_eq!(
@@ -3132,6 +3178,7 @@ Connect=File="/tmp/demo";
                 is_file: true,
                 direct_file_path: None,
                 registered_file_path: Some(PathBuf::from("/tmp/demo")),
+                direct_server: None,
             })
         );
         assert!(
@@ -3208,10 +3255,39 @@ Connect=File="/tmp/demo";
                 is_file: true,
                 direct_file_path: Some(directory.clone()),
                 registered_file_path: None,
+                direct_server: None,
             }
         );
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recognizes_direct_server_infobases_without_a_launcher_registration() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "Srvr=\"srv-1c\";Ref=\"Accounting\";"
+        }))
+        .unwrap();
+        assert_eq!(
+            info_base_target(&arguments).unwrap(),
+            InfoBaseTarget {
+                alias: "Accounting".to_owned(),
+                is_file: false,
+                direct_file_path: None,
+                registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "srv-1c".to_owned(),
+                    reference: "Accounting".to_owned(),
+                }),
+            }
+        );
+        assert_eq!(
+            direct_server_connection(&ServerInfoBase {
+                server: "srv-1c".to_owned(),
+                reference: "Accounting".to_owned(),
+            }),
+            "/Ssrv-1c\\Accounting"
+        );
     }
 
     #[test]
