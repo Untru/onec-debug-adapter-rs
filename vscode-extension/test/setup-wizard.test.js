@@ -9,6 +9,7 @@ const {
   discoverIbaseEntries,
   discoverV8ProjectEntries,
   hasCredentials,
+  ibasesFilePickerChoice,
   isSamePath,
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
@@ -117,6 +118,51 @@ test("discovers ibases from standard files and keeps no credentials", async () =
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
+});
+
+test("imports an explicitly selected ibases.v8i outside standard launcher locations", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-picked-ibases-"));
+  const selectedFile = path.join(temporary, "portable", "custom-list.v8i");
+  await fs.mkdir(path.dirname(selectedFile), { recursive: true });
+  await fs.writeFile(
+    selectedFile,
+    "[Portable file base]\nConnect=File=\"/tmp/portable-ib\";\n"
+      + "[Saved credentials stay private]\nConnect=Srvr=\"srv\";Ref=\"private\";Usr=\"user\";Pwd=\"secret\";"
+  );
+  try {
+    const entries = await discoverIbaseEntries({ files: [selectedFile] });
+    assert.deepEqual(entries.map((entry) => ({
+      name: entry.name,
+      kind: entry.kind,
+      sourceFile: entry.sourceFile,
+      hasStoredCredentials: entry.hasStoredCredentials
+    })), [
+      {
+        name: "Portable file base",
+        kind: "file",
+        sourceFile: selectedFile,
+        hasStoredCredentials: false
+      },
+      {
+        name: "Saved credentials stay private",
+        kind: "server",
+        sourceFile: selectedFile,
+        hasStoredCredentials: true
+      }
+    ]);
+    assert.equal(JSON.stringify(entries).includes("secret"), false);
+    assert.equal(JSON.stringify(entries).includes("user"), false);
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("offers an explicit file picker for an ibases.v8i outside default locations", () => {
+  assert.deepEqual(ibasesFilePickerChoice(), {
+    label: "$(file) Выбрать файл ibases.v8i…",
+    description: "Импортировать список баз из другого расположения",
+    ibasesFile: true
+  });
 });
 
 test("uses native launcher locations for each operating system", () => {

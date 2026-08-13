@@ -225,6 +225,20 @@ function mergeInfoBaseEntries(projectEntries, launcherEntries) {
   });
 }
 
+/**
+ * A standard VS Code file picker works for an ibases.v8i stored in any
+ * location (including a portable 1C installation).  Keep this item separate
+ * from the directory picker so an empty workspace can still import the
+ * launcher's registrations before it knows anything about the project.
+ */
+function ibasesFilePickerChoice() {
+  return {
+    label: "$(file) Выбрать файл ibases.v8i…",
+    description: "Импортировать список баз из другого расположения",
+    ibasesFile: true
+  };
+}
+
 function uniqueConfigurationName(configurations, preferred) {
   const names = new Set(
     configurations
@@ -395,6 +409,7 @@ module.exports = {
   discoverPlatformDirectories,
   hasCredentials,
   infoBaseIdentity,
+  ibasesFilePickerChoice,
   isSamePath,
   isMacApplicationBundle,
   isPlatformVersionDirectory,

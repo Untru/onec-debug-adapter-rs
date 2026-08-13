@@ -9,6 +9,7 @@ const {
   discoverV8ProjectEntries,
   discoverPlatformDirectories,
   hasCredentials,
+  ibasesFilePickerChoice,
   isSamePath,
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
@@ -144,6 +145,19 @@ async function pickDirectory(title, defaultUri, canSelectMany = false) {
     openLabel: canSelectMany ? "Выбрать каталоги" : "Выбрать каталог"
   });
   return selected?.map((item) => item.fsPath);
+}
+
+async function pickIbasesFile(defaultUri) {
+  const selected = await vscode.window.showOpenDialog({
+    title: "1C: Выберите файл ibases.v8i",
+    defaultUri,
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    openLabel: "Выбрать ibases.v8i",
+    filters: { "Списки баз 1С": ["v8i"] }
+  });
+  return selected?.[0]?.fsPath;
 }
 
 async function chooseBaseProject(workspaceFolder) {
@@ -443,7 +457,7 @@ async function chooseInfoBase(workspaceFolder) {
       discoverV8ProjectEntries(workspaceFolder.uri.fsPath)
     ])
   );
-  const entries = mergeInfoBaseEntries(projectEntries, launcherEntries);
+  let entries = mergeInfoBaseEntries(projectEntries, launcherEntries);
   while (true) {
     const selected = await vscode.window.showQuickPick(
       [
@@ -458,6 +472,7 @@ async function chooseInfoBase(workspaceFolder) {
           picked: entry.isDefault === true,
           entry
         })),
+        ibasesFilePickerChoice(),
         {
           label: "$(folder-opened) Выбрать каталог файловой базы…",
           description: "База, которой нет в списке запуска 1С",
@@ -475,6 +490,25 @@ async function chooseInfoBase(workspaceFolder) {
       }
     );
     if (!selected) return undefined;
+    if (selected.ibasesFile) {
+      const ibasesFile = await pickIbasesFile(workspaceFolder.uri);
+      if (!ibasesFile) continue;
+      const imported = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Window,
+          title: "1C: Чтение списка информационных баз"
+        },
+        () => discoverIbaseEntries({ files: [ibasesFile] })
+      );
+      if (!imported.length) {
+        await vscode.window.showWarningMessage(
+          "В выбранном файле ibases.v8i не найдено доступных подключений к информационным базам."
+        );
+        continue;
+      }
+      entries = mergeInfoBaseEntries(entries, imported);
+      continue;
+    }
     if (selected.entry) {
       if (selected.entry.source === "v8-project" && selected.entry.kind === "file") {
         return {
