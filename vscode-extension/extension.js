@@ -945,6 +945,145 @@ class DebugTargetsProvider {
 
 const debugTargetsProvider = new DebugTargetsProvider();
 
+class PerformanceMeasurementsProvider {
+  constructor() {
+    this.items = [];
+    this.changeEmitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this.changeEmitter.event;
+  }
+
+  update(items) {
+    this.items = Array.isArray(items) ? items : [];
+    this.changeEmitter.fire();
+  }
+
+  getTreeItem(item) {
+    const duration = Number(item.duration || 0).toFixed(3);
+    const pureDuration = Number(item.pureDuration || 0).toFixed(3);
+    const label = `${path.basename(item.source?.path || "модуль")}:${item.line}`;
+    const treeItem = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+    treeItem.description = `время ${duration}, чистое ${pureDuration}, ${item.frequency || 0} выз.`;
+    treeItem.tooltip = [
+      item.source?.path || "",
+      `Строка: ${item.line}`,
+      `Вызовы: ${item.frequency || 0}`,
+      `Общее время: ${duration} (единицы платформы)`,
+      `Чистое время: ${pureDuration} (единицы платформы)`,
+      `Сигнал серверного вызова: ${item.serverCallSignal || 0}`
+    ].join("\n");
+    treeItem.command = item.source?.path
+      ? {
+        command: "vscode.open",
+        title: "Открыть измеренную строку",
+        arguments: [vscode.Uri.file(item.source.path), { selection: new vscode.Range(item.line - 1, 0, item.line - 1, 0) }]
+      }
+      : undefined;
+    return treeItem;
+  }
+
+  getChildren(element) {
+    return element ? [] : this.items;
+  }
+}
+
+const performanceMeasurementsProvider = new PerformanceMeasurementsProvider();
+const performanceDecorations = new Map();
+
+function clearPerformanceDecorations() {
+  for (const decoration of performanceDecorations.values()) {
+    decoration.dispose();
+  }
+  performanceDecorations.clear();
+}
+
+function showPerformanceDecorations(items) {
+  clearPerformanceDecorations();
+  const bySource = new Map();
+  for (const item of items) {
+    const source = item?.source?.path;
+    if (typeof source !== "string" || !Number.isInteger(item.line) || item.line < 1) continue;
+    const values = bySource.get(source) || [];
+    values.push(item);
+    bySource.set(source, values);
+  }
+  for (const [source, sourceItems] of bySource) {
+    const decoration = vscode.window.createTextEditorDecorationType({
+      after: { color: new vscode.ThemeColor("editorCodeLens.foreground"), margin: "0 0 0 2em" },
+      isWholeLine: true
+    });
+    performanceDecorations.set(source, decoration);
+    for (const editor of vscode.window.visibleTextEditors) {
+      if (editor.document.uri.fsPath !== source) continue;
+      editor.setDecorations(decoration, sourceItems.map((item) => ({
+        range: new vscode.Range(item.line - 1, 0, item.line - 1, 0),
+        renderOptions: {
+          after: {
+            contentText: `$(pulse) ${Number(item.duration || 0).toFixed(3)} · ${item.frequency || 0} выз.`
+          }
+        },
+        hoverMessage: new vscode.MarkdownString(
+          `**Замер 1С**  \nОбщее: ${Number(item.duration || 0).toFixed(3)} (единицы платформы)  \nЧистое: ${Number(item.pureDuration || 0).toFixed(3)} (единицы платформы)  \nВызовы: ${item.frequency || 0}  \nСигнал серверного вызова: ${item.serverCallSignal || 0}`
+        )
+      })));
+    }
+  }
+}
+
+function updatePerformanceMeasurements(session) {
+  if (session?.type !== "onec") return Promise.resolve();
+  return session
+    .customRequest("PerformanceMeasurementResultsRequest")
+    .then((body) => {
+      const results = body?.results || [];
+      performanceMeasurementsProvider.update(results);
+      showPerformanceDecorations(results);
+    })
+    .catch(() => undefined);
+}
+
+async function startPerformanceMeasurement() {
+  const session = activeOnecDebugSession();
+  if (!session) {
+    await vscode.window.showErrorMessage("Сначала запустите отладку 1С и дождитесь цели отладки.");
+    return;
+  }
+  const response = await session.customRequest("threads");
+  const threads = Array.isArray(response?.threads) ? response.threads : [];
+  if (threads.length === 0) {
+    await vscode.window.showErrorMessage("Нет подключённых целей 1С. Выполните действие в тонком клиенте и подключите цель отладки.");
+    return;
+  }
+  const selected = await vscode.window.showQuickPick(
+    threads.map((thread) => ({ label: thread.name, description: `поток ${thread.id}`, threadId: thread.id })),
+    {
+      title: "1C: Начать замер производительности",
+      placeHolder: "Выберите активную цель 1С (платформа может вернуть результаты по нескольким целям)"
+    }
+  );
+  if (!selected) return;
+  try {
+    await session.customRequest("StartPerformanceMeasurementRequest", { threadId: selected.threadId });
+  } catch (error) {
+    await vscode.window.showErrorMessage(`Не удалось начать замер производительности: ${error.message || error}`);
+    return;
+  }
+  performanceMeasurementsProvider.update([]);
+  clearPerformanceDecorations();
+  await vscode.window.showInformationMessage("Замер производительности 1С запущен.");
+}
+
+async function stopPerformanceMeasurement() {
+  const session = activeOnecDebugSession();
+  if (!session) return;
+  try {
+    await session.customRequest("StopPerformanceMeasurementRequest");
+  } catch (error) {
+    await vscode.window.showErrorMessage(`Не удалось остановить замер производительности: ${error.message || error}`);
+    return;
+  }
+  await vscode.window.showInformationMessage("Замер остановлен; ожидаю результаты от платформы 1С.");
+}
+
 function activeOnecDebugSession() {
   const session = vscode.debug.activeDebugSession;
   return session?.type === "onec" ? session : undefined;
@@ -984,6 +1123,21 @@ function activate(context) {
     vscode.window.registerTreeDataProvider("debug.debugTargets", debugTargetsProvider)
   );
   context.subscriptions.push(
+    vscode.window.registerTreeDataProvider("debug.performanceMeasurements", performanceMeasurementsProvider)
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("onec.performance.start", startPerformanceMeasurement)
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("onec.performance.stop", stopPerformanceMeasurement)
+  );
+  context.subscriptions.push(
+    vscode.commands.registerCommand("onec.performance.clear", () => {
+      performanceMeasurementsProvider.update([]);
+      clearPerformanceDecorations();
+    })
+  );
+  context.subscriptions.push(
     vscode.commands.registerCommand("debug.debugTargets.refresh", () =>
       updateDebugTargets(activeOnecDebugSession())
     )
@@ -1010,7 +1164,14 @@ function activate(context) {
     vscode.debug.onDidTerminateDebugSession((session) => {
       if (session.type === "onec") {
         debugTargetsProvider.update([]);
+        performanceMeasurementsProvider.update([]);
+        clearPerformanceDecorations();
       }
+    })
+  );
+  context.subscriptions.push(
+    vscode.window.onDidChangeVisibleTextEditors(() => {
+      showPerformanceDecorations(performanceMeasurementsProvider.items);
     })
   );
   context.subscriptions.push(
@@ -1020,6 +1181,12 @@ function activate(context) {
         debugEvent.event === "DebugTargetsUpdated"
       ) {
         updateDebugTargets(debugEvent.session);
+      }
+      if (
+        debugEvent.session.type === "onec" &&
+        debugEvent.event === "PerformanceMeasurementUpdated"
+      ) {
+        updatePerformanceMeasurements(debugEvent.session);
       }
     })
   );
@@ -1056,6 +1223,10 @@ module.exports = {
   configurationRoot,
   discoverConfigurationRoots,
   extensionRoot,
+  PerformanceMeasurementsProvider,
+  performanceMeasurementsProvider,
+  updatePerformanceMeasurements,
+  clearPerformanceDecorations,
   isPlatformVersionDirectory,
   validatePlatformDirectory
 };

@@ -27,7 +27,7 @@ pub struct DebugUiSession {
 }
 
 /// A command delivered asynchronously by the 1C debug server to a Debug UI.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DebugUiEvent {
     pub command_id: String,
     pub target_id: Option<String>,
@@ -38,6 +38,35 @@ pub struct DebugUiEvent {
     pub send_hit_counter_only: bool,
     pub message: Option<String>,
     pub evaluation: Option<DebugEvaluation>,
+    pub measurement: Option<DebugMeasurement>,
+}
+
+/// One measurement batch delivered by RDBG after a profiling session ends.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DebugMeasurement {
+    pub target_id: String,
+    pub session_id: String,
+    pub total_duration: f64,
+    pub total_independent_server_work_time: f64,
+    pub performance_frequency: f64,
+    pub modules: Vec<DebugMeasuredModule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DebugMeasuredModule {
+    pub extension_name: String,
+    pub object_id: String,
+    pub property_id: String,
+    pub lines: Vec<DebugMeasuredLine>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DebugMeasuredLine {
+    pub line: i64,
+    pub frequency: f64,
+    pub duration: f64,
+    pub pure_duration: f64,
+    pub server_call_signal: f64,
 }
 
 /// A debuggable 1C execution context returned by `getDbgTargets`.
@@ -115,7 +144,7 @@ pub struct PingTimings {
     pub parse_elapsed: Duration,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PingResult {
     pub events: Vec<DebugUiEvent>,
     pub timings: PingTimings,
@@ -398,6 +427,15 @@ impl DebugServer {
         .map(|_| ())
     }
 
+    /// Enables profiling for a non-zero UUID, or disables it with the all-zero
+    /// UUID. RDBG returns the resulting per-line samples asynchronously in a
+    /// `measureResultProcessing` Debug UI event.
+    pub fn set_measure_mode(&self, session: &DebugUiSession, session_id: &str) -> Result<()> {
+        Uuid::parse_str(session_id).context("performance session id must be a UUID")?;
+        self.post_xml("setMeasureMode", &measure_mode_request(session, session_id))
+            .map(|_| ())
+    }
+
     /// Starts evaluating an expression in a stopped target stack frame.
     ///
     /// RDBG normally answers in this HTTP response, but older servers may
@@ -616,6 +654,18 @@ fn runtime_error_processing_request(
         "</request>",
         &format!(
             "<state xmlns=\"{RTE_FILTER_NAMESPACE}\"><stopOnErrors>{stop_on_errors}</stopOnErrors><analyzeErrorStr>{analyze_error}</analyzeErrorStr>{template}</state></request>"
+        ),
+        1,
+    )
+}
+
+fn measure_mode_request(session: &DebugUiSession, session_id: &str) -> String {
+    let base = base_request(session);
+    base.replacen(
+        "</request>",
+        &format!(
+            "<measureModeSeanceID>{}</measureModeSeanceID></request>",
+            xml_escape(session_id)
         ),
         1,
     )
@@ -922,6 +972,9 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
     let mut current_stack_frame = None;
     let mut current_evaluation_variable = None;
     let mut evaluation_collection_index = 0_i64;
+    let mut current_measurement = None;
+    let mut current_measured_module = None;
+    let mut current_measured_line = None;
     let mut events = Vec::new();
 
     loop {
@@ -933,6 +986,12 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                     current_event = Some(DebugUiEvent::default());
                 } else if current_event.is_some() && name == "callStack" {
                     current_stack_frame = Some(DebugStackFrame::default());
+                } else if current_event.is_some() && name == "measure" {
+                    current_measurement = Some(DebugMeasurement::default());
+                } else if current_measurement.is_some() && name == "moduleData" {
+                    current_measured_module = Some(DebugMeasuredModule::default());
+                } else if current_measured_module.is_some() && name == "lineInfo" {
+                    current_measured_line = Some(DebugMeasuredLine::default());
                 }
                 if current_stack_frame.is_none() && name == "valueOfContextPropInfo" {
                     current_evaluation_variable = Some(DebugVariable::default());
@@ -953,6 +1012,27 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                         (&mut current_event, current_stack_frame.take())
                     {
                         event.call_stack.push(frame);
+                    }
+                }
+                if name == "lineInfo" {
+                    if let (Some(module), Some(line)) =
+                        (&mut current_measured_module, current_measured_line.take())
+                    {
+                        module.lines.push(line);
+                    }
+                }
+                if name == "moduleData" {
+                    if let (Some(measurement), Some(module)) =
+                        (&mut current_measurement, current_measured_module.take())
+                    {
+                        measurement.modules.push(module);
+                    }
+                }
+                if name == "measure" {
+                    if let (Some(event), Some(measurement)) =
+                        (&mut current_event, current_measurement.take())
+                    {
+                        event.measurement = Some(measurement);
                     }
                 }
                 if matches!(
@@ -1026,6 +1106,40 @@ fn parse_debug_ui_events(xml: &str) -> Result<Vec<DebugUiEvent>> {
                     }),
                     _ => {}
                 }
+                if let Some(measurement) = &mut current_measurement {
+                    match name {
+                        "sessionID" => measurement.session_id = value.clone(),
+                        "totalDurability" => measurement.total_duration = xml_number(&value),
+                        "totalIndepServerWorkTime" => {
+                            measurement.total_independent_server_work_time = xml_number(&value)
+                        }
+                        "performanceFrequency" => {
+                            measurement.performance_frequency = xml_number(&value)
+                        }
+                        "id" if names.iter().any(|name| name == "targetID") => {
+                            measurement.target_id = value.clone()
+                        }
+                        _ => {}
+                    }
+                }
+                if let Some(module) = &mut current_measured_module {
+                    match name {
+                        "extensionName" => module.extension_name = value.clone(),
+                        "objectID" => module.object_id = value.clone(),
+                        "propertyID" => module.property_id = value.clone(),
+                        _ => {}
+                    }
+                }
+                if let Some(line) = &mut current_measured_line {
+                    match name {
+                        "lineNo" => line.line = value.parse().unwrap_or_default(),
+                        "frequency" => line.frequency = xml_number(&value),
+                        "durability" => line.duration = xml_number(&value),
+                        "pureDurability" => line.pure_duration = xml_number(&value),
+                        "serverCallSignal" => line.server_call_signal = xml_number(&value),
+                        _ => {}
+                    }
+                }
                 if current_stack_frame.is_none() {
                     if let Some(variable) = &mut current_evaluation_variable {
                         match name {
@@ -1072,6 +1186,10 @@ fn set_stack_field(frame: &mut Option<DebugStackFrame>, set: impl FnOnce(&mut De
 
 fn xml_bool(value: &str) -> bool {
     value == "true" || value == "1"
+}
+
+fn xml_number(value: &str) -> f64 {
+    value.trim().replace(',', ".").parse().unwrap_or_default()
 }
 
 fn error_flag(error: &mut Option<String>, value: &str) {
@@ -1224,6 +1342,41 @@ mod tests {
             "<targetID><id xmlns=\"{DEBUG_BASE_NAMESPACE}\">target-1</id></targetID>"
         )));
         assert!(xml.contains("<action>StepIn</action>"));
+    }
+
+    #[test]
+    fn serializes_measure_mode_session_id() {
+        let session = DebugUiSession {
+            id: "debug-ui".to_owned(),
+            info_base_alias: "DemoBase".to_owned(),
+        };
+        let measure_id = "d2719a24-ef17-4cf1-a1bd-9efb11d8f349";
+
+        let xml = measure_mode_request(&session, measure_id);
+
+        assert!(xml.contains(&format!(
+            "<measureModeSeanceID>{measure_id}</measureModeSeanceID>"
+        )));
+    }
+
+    #[test]
+    fn parses_measurement_event() {
+        let events = parse_debug_ui_events(
+            "<response><result><cmdID>measureResultProcessing</cmdID><measure><targetID><id>target-1</id></targetID><totalDurability>17.5</totalDurability><totalIndepServerWorkTime>3</totalIndepServerWorkTime><performanceFrequency>11</performanceFrequency><moduleData><moduleID><extensionName></extensionName><objectID>object-id</objectID><propertyID>property-id</propertyID></moduleID><lineInfo><lineNo>42</lineNo><frequency>7</frequency><durability>8.5</durability><pureDurability>6</pureDurability><serverCallSignal>1</serverCallSignal></lineInfo></moduleData><sessionID>d2719a24-ef17-4cf1-a1bd-9efb11d8f349</sessionID></measure></result></response>",
+        )
+        .unwrap();
+
+        let measurement = events[0].measurement.as_ref().unwrap();
+        assert_eq!(measurement.target_id, "target-1");
+        assert_eq!(
+            measurement.session_id,
+            "d2719a24-ef17-4cf1-a1bd-9efb11d8f349"
+        );
+        assert_eq!(measurement.total_duration, 17.5);
+        assert_eq!(measurement.modules.len(), 1);
+        assert_eq!(measurement.modules[0].object_id, "object-id");
+        assert_eq!(measurement.modules[0].lines[0].line, 42);
+        assert_eq!(measurement.modules[0].lines[0].pure_duration, 6.0);
     }
 
     #[test]

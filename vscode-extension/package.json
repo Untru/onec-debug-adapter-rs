@@ -46,6 +46,10 @@
         {
           "id": "debug.debugTargets",
           "name": "Цели отладки"
+        },
+        {
+          "id": "debug.performanceMeasurements",
+          "name": "Замеры производительности"
         }
       ]
     },
@@ -61,6 +65,18 @@
       {
         "command": "debug.debugTargets.refresh",
         "title": "Обновить цели отладки"
+      },
+      {
+        "command": "onec.performance.start",
+        "title": "1C: Начать замер производительности"
+      },
+      {
+        "command": "onec.performance.stop",
+        "title": "1C: Остановить замер производительности"
+      },
+      {
+        "command": "onec.performance.clear",
+        "title": "1C: Очистить результаты замера"
       }
     ],
     "menus": {
@@ -74,6 +90,21 @@
           "command": "debug.debugTargets.refresh",
           "when": "view == debug.debugTargets",
           "group": "navigation"
+        },
+        {
+          "command": "onec.performance.start",
+          "when": "view == debug.performanceMeasurements && debugState == running",
+          "group": "navigation@1"
+        },
+        {
+          "command": "onec.performance.stop",
+          "when": "view == debug.performanceMeasurements && debugState == running",
+          "group": "navigation@2"
+        },
+        {
+          "command": "onec.performance.clear",
+          "when": "view == debug.performanceMeasurements",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
