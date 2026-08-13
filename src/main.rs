@@ -12,7 +12,7 @@ use debug_server::{
 use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write, stderr};
 use std::path::{Path, PathBuf};
@@ -480,13 +480,7 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
     let direct_file_path = direct_file_infobase_path(info_base);
     let launcher_target = direct_file_path
         .is_none()
-        .then(|| {
-            ibases_paths().into_iter().find_map(|path| {
-                fs::read_to_string(path)
-                    .ok()
-                    .and_then(|contents| launcher_info_base(&contents, info_base))
-            })
-        })
+        .then(|| launcher_info_base_from_paths(&ibases_paths(), info_base))
         .flatten();
     let is_file = direct_file_path.is_some()
         || launcher_target
@@ -511,35 +505,175 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
 }
 
 fn ibases_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    ibases_paths_from_startup_directories(launcher_startup_directories(
+        current_launcher_platform(),
+        home_dir.as_deref(),
+        app_data.as_deref(),
+        local_app_data.as_deref(),
+    ))
+}
+
+/// Directories used by 1C:Enterprise launcher to store a user's list of
+/// information bases.  Newer macOS/Linux installations use `.1C/1cestart`;
+/// the older locations remain intentionally supported for existing users.
+fn launcher_startup_directories(
+    platform: &str,
+    home_dir: Option<&Path>,
+    app_data: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Vec<PathBuf> {
+    match platform {
+        "windows" => [app_data, local_app_data]
+            .into_iter()
+            .flatten()
+            .map(|directory| directory.join("1C").join("1CEStart"))
+            .collect(),
+        "macos" => home_dir
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join(".1C").join("1cestart"),
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("1C")
+                        .join("1CEStart"),
+                    home.join(".1cv8").join("1C").join("1CEStart"),
+                ]
+            })
+            .collect(),
+        _ => home_dir
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join(".1C").join("1cestart"),
+                    home.join(".1cv8").join("1C").join("1CEStart"),
+                ]
+            })
+            .collect(),
+    }
+}
+
+fn current_launcher_platform() -> &'static str {
     if cfg!(windows) {
-        if let Some(app_data) = std::env::var_os("APPDATA") {
-            paths.push(
-                PathBuf::from(app_data)
-                    .join("1C")
-                    .join("1CEStart")
-                    .join("ibases.v8i"),
-            );
-        }
-    } else if let Some(home_dir) = std::env::var_os("HOME") {
-        let home_dir = PathBuf::from(home_dir);
-        paths.push(
-            home_dir
-                .join(".1cv8")
-                .join("1C")
-                .join("1CEStart")
-                .join("ibases.v8i"),
-        );
-        paths.push(
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("1C")
-                .join("1CEStart")
-                .join("ibases.v8i"),
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "unix"
+    }
+}
+
+/// Finds the normal user list plus all lists configured by
+/// `CommonInfoBases` in each `1cestart.cfg`.  A common list can be an
+/// absolute path or a path relative to the launcher directory.
+fn ibases_paths_from_startup_directories(startup_directories: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = startup_directories
+        .iter()
+        .map(|directory| directory.join("ibases.v8i"))
+        .collect::<Vec<_>>();
+    for directory in &startup_directories {
+        let config_path = directory.join("1cestart.cfg");
+        let Some(config) = read_platform_text(&config_path) else {
+            continue;
+        };
+        paths.extend(
+            common_info_base_list_paths(&config)
+                .into_iter()
+                .map(|value| {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        directory.join(path)
+                    }
+                }),
         );
     }
+    unique_launcher_paths(paths)
+}
+
+fn unique_launcher_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
     paths
+        .into_iter()
+        .filter(|path| {
+            let normalized = path.to_string_lossy();
+            let key = if cfg!(windows) {
+                normalized.to_ascii_lowercase()
+            } else {
+                normalized.into_owned()
+            };
+            seen.insert(key)
+        })
+        .collect()
+}
+
+fn common_info_base_list_paths(config: &str) -> Vec<String> {
+    config
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            let (key, value) = line.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("CommonInfoBases")
+                .then_some(value)
+        })
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .map(|path| path.trim_matches('"').trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 1C platform files are normally UTF-8, but the launcher also writes
+/// UTF-16LE (with a BOM) on some platform/OS combinations.
+fn read_platform_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    decode_platform_text(&bytes).ok()
+}
+
+fn decode_platform_text(bytes: &[u8]) -> Result<String> {
+    let text = match bytes {
+        [0xff, 0xfe, rest @ ..] => decode_utf16_platform_text(rest, true)?,
+        [0xfe, 0xff, rest @ ..] => decode_utf16_platform_text(rest, false)?,
+        [0xef, 0xbb, 0xbf, rest @ ..] => std::str::from_utf8(rest)
+            .context("1C launcher file is not valid UTF-8")?
+            .to_owned(),
+        _ => std::str::from_utf8(bytes)
+            .context("1C launcher file is not valid UTF-8")?
+            .to_owned(),
+    };
+    Ok(text)
+}
+
+fn decode_utf16_platform_text(bytes: &[u8], little_endian: bool) -> Result<String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        anyhow::bail!("1C launcher file contains incomplete UTF-16 data");
+    }
+    let words = chunks
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&words).context("1C launcher file is not valid UTF-16")
+}
+
+fn launcher_info_base_from_paths(
+    paths: &[PathBuf],
+    info_base_name: &str,
+) -> Option<InfoBaseTarget> {
+    paths.iter().find_map(|path| {
+        read_platform_text(path).and_then(|contents| launcher_info_base(&contents, info_base_name))
+    })
 }
 
 fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarget> {
@@ -2528,6 +2662,116 @@ Connect=File="/tmp/demo";
             })
         );
         assert_eq!(launcher_info_base(ibases, "Missing"), None);
+    }
+
+    #[test]
+    fn discovers_current_launcher_locations_and_retains_legacy_locations() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            launcher_startup_directories("macos", Some(home), None, None),
+            vec![
+                home.join(".1C/1cestart"),
+                home.join("Library/Application Support/1C/1CEStart"),
+                home.join(".1cv8/1C/1CEStart"),
+            ]
+        );
+        assert_eq!(
+            launcher_startup_directories("unix", Some(home), None, None),
+            vec![home.join(".1C/1cestart"), home.join(".1cv8/1C/1CEStart")]
+        );
+        assert_eq!(
+            launcher_startup_directories(
+                "windows",
+                None,
+                Some(Path::new("C:/Users/tester/AppData/Roaming")),
+                Some(Path::new("C:/Users/tester/AppData/Local")),
+            ),
+            vec![
+                PathBuf::from("C:/Users/tester/AppData/Roaming/1C/1CEStart"),
+                PathBuf::from("C:/Users/tester/AppData/Local/1C/1CEStart"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_registered_infobases_from_common_launcher_lists_without_credentials() {
+        let root = std::env::temp_dir().join(format!("onec-ibases-{}", uuid::Uuid::new_v4()));
+        let launcher_directory = root.join(".1C/1cestart");
+        let relative_list = launcher_directory.join("shared/ibases.v8i");
+        let absolute_list = root.join("global.v8i");
+        fs::create_dir_all(relative_list.parent().unwrap()).unwrap();
+        fs::write(
+            launcher_directory.join("1cestart.cfg"),
+            format!(
+                "[Startup]\nCommonInfoBases=shared/ibases.v8i;\"{}\"\n",
+                absolute_list.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &relative_list,
+            "[Сервис локально]\nConnect=Srvr=\"localhost\";Ref=\"Service\";Usr=\"developer\";Pwd=\"secret\";\n",
+        )
+        .unwrap();
+        let mut utf16le = vec![0xff, 0xfe];
+        utf16le.extend(
+            "[Файловая]\nConnect=File=\"/tmp/demo\";\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        fs::write(&absolute_list, utf16le).unwrap();
+
+        let paths = ibases_paths_from_startup_directories(vec![launcher_directory.clone()]);
+        assert_eq!(
+            paths,
+            vec![
+                launcher_directory.join("ibases.v8i"),
+                relative_list.clone(),
+                absolute_list.clone(),
+            ]
+        );
+        assert_eq!(
+            launcher_info_base_from_paths(&paths, "Сервис локально"),
+            Some(InfoBaseTarget {
+                alias: "Service".to_owned(),
+                is_file: false,
+                direct_file_path: None,
+            })
+        );
+        assert_eq!(
+            launcher_info_base_from_paths(&paths, "Файловая"),
+            Some(InfoBaseTarget {
+                alias: FILE_INFOBASE_ALIAS.to_owned(),
+                is_file: true,
+                direct_file_path: None,
+            })
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                launcher_info_base_from_paths(&paths, "Сервис локально")
+            )
+            .contains("secret")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_common_info_base_paths_and_launcher_file_encodings() {
+        assert_eq!(
+            common_info_base_list_paths(
+                "CommonInfoBases = first.v8i; \"second.v8i\"\ncommoninfobases=third.v8i\n"
+            ),
+            vec![
+                "first.v8i".to_owned(),
+                "second.v8i".to_owned(),
+                "third.v8i".to_owned(),
+            ]
+        );
+        let mut utf16be = vec![0xfe, 0xff];
+        utf16be.extend("[База]".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(decode_platform_text(&utf16be).unwrap(), "[База]");
+        assert!(decode_platform_text(&[0xff, 0xfe, 1]).is_err());
     }
 
     #[test]
