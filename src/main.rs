@@ -214,6 +214,13 @@ struct ConnectionArguments {
     debug_server_port: u16,
     info_base: Option<String>,
     info_base_alias: Option<String>,
+    /// 1C user passed to a newly launched thin client as `/N`.
+    user_name: Option<String>,
+    /// 1C password passed to a newly launched thin client as `/P`.
+    ///
+    /// The adapter never sends this value to RDBG or writes it to traces.
+    /// Prefer a VS Code `${input:...}` value over literal text in launch.json.
+    password: Option<String>,
     root_project: Option<String>,
     platform_path: Option<String>,
     platform_version: Option<String>,
@@ -339,6 +346,7 @@ fn launch_debuggee(
                 .context("launch requires infoBase")?,
         ]);
     }
+    append_client_credentials(&mut command, arguments)?;
     command
         .args([
             "/TCOMP",
@@ -356,6 +364,31 @@ fn launch_debuggee(
         ])
         .spawn()
         .with_context(|| format!("cannot start 1C client {}", executable.display()))
+}
+
+/// Adds optional 1C authentication switches without involving the debug
+/// server.  `/P` without `/N` is rejected early: the platform would otherwise
+/// show a less useful interactive login prompt after the debug session starts.
+fn append_client_credentials(command: &mut Command, arguments: &ConnectionArguments) -> Result<()> {
+    let user_name = arguments
+        .user_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let password = arguments
+        .password
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    if password.is_some() && user_name.is_none() {
+        anyhow::bail!("password requires userName");
+    }
+    if let Some(user_name) = user_name {
+        command.arg("/N").arg(user_name);
+    }
+    if let Some(password) = password {
+        command.arg("/P").arg(password);
+    }
+    Ok(())
 }
 
 fn standalone_server_url(arguments: &ConnectionArguments) -> String {
@@ -2602,6 +2635,8 @@ mod tests {
                     debug_server_port: 1550,
                     info_base: Some("Demo".to_owned()),
                     info_base_alias: None,
+                    user_name: None,
+                    password: None,
                     root_project: None,
                     platform_path: None,
                     platform_version: None,
@@ -2927,6 +2962,8 @@ Connect=File="/tmp/demo";
     fn parses_the_standalone_server_launch_configuration() {
         let arguments: ConnectionArguments = serde_json::from_value(json!({
             "infoBase": "/tmp/demo",
+            "userName": "developer",
+            "password": "not-written-anywhere",
             "platformPath": "/opt/1cv8/8.3.27",
             "launchMode": "standaloneServer",
             "standaloneServerHost": "127.0.0.1",
@@ -2941,6 +2978,8 @@ Connect=File="/tmp/demo";
         }))
         .unwrap();
         assert_eq!(arguments.launch_mode, LaunchMode::StandaloneServer);
+        assert_eq!(arguments.user_name.as_deref(), Some("developer"));
+        assert_eq!(arguments.password.as_deref(), Some("not-written-anywhere"));
         assert_eq!(
             arguments.standalone_server_host.as_deref(),
             Some("127.0.0.1")
@@ -2993,6 +3032,21 @@ Connect=File="/tmp/demo";
         assert_eq!(
             standalone_server_url(&published),
             "http://localhost:8320/demo"
+        );
+    }
+
+    #[test]
+    fn rejects_password_without_a_user_name_before_launching_the_client() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "password": "secret"
+        }))
+        .unwrap();
+        let mut command = Command::new("true");
+        assert!(
+            append_client_credentials(&mut command, &arguments)
+                .unwrap_err()
+                .to_string()
+                .contains("password requires userName")
         );
     }
 
@@ -3127,6 +3181,8 @@ Connect=File="/tmp/demo";
             debug_server_port: 1550,
             info_base: Some(direct),
             info_base_alias: Some("IgnoredForFileBase".to_owned()),
+            user_name: None,
+            password: None,
             root_project: None,
             platform_path: None,
             platform_version: None,
@@ -3167,6 +3223,8 @@ Connect=File="/tmp/demo";
             debug_server_port: 1550,
             info_base: Some("Demo".to_owned()),
             info_base_alias: None,
+            user_name: None,
+            password: None,
             root_project: None,
             platform_path: None,
             platform_version: None,

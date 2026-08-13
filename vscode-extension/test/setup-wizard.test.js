@@ -72,11 +72,16 @@ test("summarizes the standalone server launch mode", () => {
     standaloneServerDirectRegPort: 1941,
     standaloneServerDirectRange: "1960:1991",
     standaloneServerDataPath: "/work/.vscode/onec-standalone-server",
+    userName: "Developer",
+    password: "${input:onec.debugger.password}",
     autoAttachTypes: ["ManagedClient", "Server"]
   });
   assert.match(summary, /автономный сервер \(ibsrv\)/);
   assert.match(summary, /прямой TCP\/IP \(onec-debug-1941\)/);
   assert.match(summary, /localhost:8314\//);
+  assert.match(summary, /Пользователь 1С: Developer/);
+  assert.match(summary, /Пароль: будет запрошен VS Code/);
+  assert.doesNotMatch(summary, /onec\.debugger\.password/);
   assert.doesNotMatch(summary, /SSH/);
 });
 

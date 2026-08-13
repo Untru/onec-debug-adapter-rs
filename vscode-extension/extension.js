@@ -699,6 +699,51 @@ async function chooseDebugServer() {
   return { host: host.trim(), port: Number(portValue) };
 }
 
+async function chooseLaunchCredentials(request) {
+  if (request !== "launch") return { userName: undefined };
+  const choice = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Без авторизации",
+        description: "Клиент покажет обычный вход, если база его требует"
+      },
+      {
+        label: "Указать пользователя и спрашивать пароль при запуске",
+        description: "Пароль не записывается в launch.json",
+        credentials: true
+      }
+    ],
+    {
+      title: "1C: Авторизация при запуске",
+      placeHolder: "Выберите способ входа в базу"
+    }
+  );
+  if (!choice) return undefined;
+  if (!choice.credentials) return { userName: undefined };
+  const userName = await vscode.window.showInputBox({
+    title: "1C: Пользователь базы",
+    prompt: "Имя пользователя будет передано тонкому клиенту как /N",
+    placeHolder: "Например, Администратор",
+    validateInput: (value) => value.trim() ? undefined : "Укажите имя пользователя."
+  });
+  return userName === undefined ? undefined : { userName: userName.trim() };
+}
+
+function passwordInputId(inputs) {
+  const used = new Set(
+    inputs
+      .filter((input) => input && typeof input.id === "string")
+      .map((input) => input.id)
+  );
+  let suffix = 1;
+  let id = "onec.debugger.password";
+  while (used.has(id)) {
+    suffix += 1;
+    id = `onec.debugger.password.${suffix}`;
+  }
+  return id;
+}
+
 async function chooseOptionalAlias() {
   const alias = await vscode.window.showInputBox({
     title: "1C: Псевдоним информационной базы",
@@ -755,6 +800,8 @@ async function configureDebugger() {
 
   const request = await chooseRequest(selectedInfoBase);
   if (!request) return;
+  const credentials = await chooseLaunchCredentials(request);
+  if (!credentials) return;
   const launchMode = await chooseLaunchMode(selectedInfoBase, request);
   if (!launchMode) return;
   const standaloneTransport = await chooseStandaloneTransport(launchMode);
@@ -766,6 +813,10 @@ async function configureDebugger() {
   if (!aliasResult) return;
 
   const existing = await launchConfigurationsFor(workspaceFolder);
+  const existingInputs = vscode.workspace
+    .getConfiguration("launch", workspaceFolder.uri)
+    .get("inputs", []);
+  const inputs = Array.isArray(existingInputs) ? existingInputs : [];
   const mode = request === "launch" ? "запуск" : "подключение";
   const configuration = {
     name: uniqueConfigurationName(existing, `1C: ${path.basename(rootProject)} (${mode})`),
@@ -781,6 +832,18 @@ async function configureDebugger() {
   if (selectedInfoBase.infoBaseAlias) configuration.infoBaseAlias = selectedInfoBase.infoBaseAlias;
   if (aliasResult.value) configuration.infoBaseAlias = aliasResult.value;
   if (extensions.length) configuration.extensions = extensions.map((extension) => extension.path);
+  let passwordInput;
+  if (credentials.userName) {
+    const inputId = passwordInputId(inputs);
+    configuration.userName = credentials.userName;
+    configuration.password = `\${input:${inputId}}`;
+    passwordInput = {
+      id: inputId,
+      type: "promptString",
+      description: `Пароль пользователя «${credentials.userName}» для 1С`,
+      password: true
+    };
+  }
   if (request === "launch") {
     configuration.platformPath = selectedPlatformPath;
     configuration.platformVersion = "LATEST";
@@ -820,9 +883,15 @@ async function configureDebugger() {
     configuration.name
   );
   try {
-    await vscode.workspace
-      .getConfiguration("launch", workspaceFolder.uri)
-      .update(
+    const launchSettings = vscode.workspace.getConfiguration("launch", workspaceFolder.uri);
+    if (passwordInput) {
+      await launchSettings.update(
+        "inputs",
+        [...inputs, passwordInput],
+        vscode.ConfigurationTarget.WorkspaceFolder
+      );
+    }
+    await launchSettings.update(
         "configurations",
         [...latest, configuration],
         vscode.ConfigurationTarget.WorkspaceFolder

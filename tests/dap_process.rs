@@ -536,6 +536,7 @@ while true; do sleep 1; done
             concat!(
                 r#"{{"seq":2,"type":"request","command":"launch","arguments":{{"#,
                 r#""infoBase":"FileDemo","platformPath":"{}","#,
+                r#""userName":"developer","password":"test-password","#,
                 r#""debugServerHost":"127.0.0.1","debugServerPort":1}}}}"#
             ),
             root.display()
@@ -567,6 +568,7 @@ while true; do sleep 1; done
     assert!(dbgs_args.contains("--addr=127.0.0.1"));
     let client_args = fs::read_to_string(root.join("client.args")).unwrap();
     assert!(client_args.contains("/IBName\nFileDemo"));
+    assert!(client_args.contains("/N\ndeveloper\n/P\ntest-password"));
     assert!(client_args.contains("-http\n-attach"));
     assert!(client_args.contains(&format!("/DEBUGGERURL\nhttp://127.0.0.1:{}", rdbg.port)));
     let requests = rdbg.requests.lock().unwrap().clone();

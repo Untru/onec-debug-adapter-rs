@@ -345,6 +345,10 @@ function configurationSummary(configuration) {
   if (configuration.infoBaseAlias) {
     lines.push(`Псевдоним базы: ${configuration.infoBaseAlias}`);
   }
+  if (configuration.userName) {
+    lines.push(`Пользователь 1С: ${configuration.userName}`);
+    lines.push("Пароль: будет запрошен VS Code при запуске");
+  }
   if (configuration.request === "launch") {
     lines.push(`Платформа: ${configuration.platformPath}`);
     lines.push(`Версия платформы: ${configuration.platformVersion}`);

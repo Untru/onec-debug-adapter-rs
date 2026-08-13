@@ -181,6 +181,14 @@
                 "type": "string",
                 "description": "Explicit server-side infobase alias; takes precedence over infoBase"
               },
+              "userName": {
+                "type": "string",
+                "description": "Optional 1C user name passed to the launched thin client as /N"
+              },
+              "password": {
+                "type": "string",
+                "description": "Optional 1C password passed to the launched thin client as /P. Prefer a VS Code ${input:...} prompt instead of literal text."
+              },
               "debugServerHost": {
                 "type": "string",
                 "default": "localhost",
