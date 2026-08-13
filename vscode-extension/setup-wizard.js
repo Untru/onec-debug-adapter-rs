@@ -73,10 +73,26 @@ function configurationSummary(configuration) {
   return lines.join("\n");
 }
 
+function noExtensionSourceChoices() {
+  return [
+    {
+      label: "Продолжить без расширений",
+      description: "Настроить отладку только основной конфигурации",
+      continueWithoutExtensions: true
+    },
+    {
+      label: "$(folder-opened) Добавить каталоги вне рабочей области…",
+      description: "Каждый каталог должен содержать Configuration.xml",
+      browse: true
+    }
+  ];
+}
+
 module.exports = {
   configurationSummary,
   hasCredentials,
   isSamePath,
+  noExtensionSourceChoices,
   parseExtensionName,
   uniqueConfigurationName
 };

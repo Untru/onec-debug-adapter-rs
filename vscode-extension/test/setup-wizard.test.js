@@ -3,6 +3,7 @@ const test = require("node:test");
 const {
   hasCredentials,
   isSamePath,
+  noExtensionSourceChoices,
   parseExtensionName,
   uniqueConfigurationName
 } = require("../setup-wizard");
@@ -33,4 +34,11 @@ test("recognizes credential-bearing connection strings", () => {
 
 test("compares normalized paths", () => {
   assert.equal(isSamePath("./example", "example"), true);
+});
+
+test("offers an explicit continuation when no extension sources are found", () => {
+  const choices = noExtensionSourceChoices();
+  assert.equal(choices[0].label, "Продолжить без расширений");
+  assert.equal(choices[0].continueWithoutExtensions, true);
+  assert.equal(choices[1].browse, true);
 });

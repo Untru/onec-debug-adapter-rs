@@ -5,6 +5,7 @@ const {
   configurationSummary,
   hasCredentials,
   isSamePath,
+  noExtensionSourceChoices,
   parseExtensionName,
   uniqueConfigurationName
 } = require("./setup-wizard");
@@ -220,43 +221,57 @@ async function chooseExtensions(workspaceFolder, baseProject) {
   const discovered = await discoveredExtensionCandidates(workspaceFolder, baseProject);
   let selectedPaths = [];
   while (true) {
+    // A multi-select QuickPick cannot be accepted without a checked item.  When
+    // no extensions were found, use a regular QuickPick with an explicit
+    // continuation item so keyboard and accessibility-tool users can advance.
+    const hasOnlyExternalChoices = discovered.length === 0 && selectedPaths.length === 0;
     const knownByPath = new Map(discovered.map((item) => [item.path, item]));
     const selected = await vscode.window.showQuickPick(
-      [
-        ...discovered.map((extension) => ({
-          label: extension.name,
-          description: formatPathForWorkspace(extension.path, workspaceFolder),
-          detail: extension.path,
-          path: extension.path,
-          picked: selectedPaths.some((item) => isSamePath(item, extension.path))
-        })),
-        ...selectedPaths
-          .filter((item) => !knownByPath.has(item))
-          .map((item) => ({
-            label: `$(folder) ${path.basename(item)}`,
-            description: "Выбранный внешний каталог",
-            detail: item,
-            path: item,
-            picked: true
+      hasOnlyExternalChoices
+        ? noExtensionSourceChoices()
+        : [
+          ...discovered.map((extension) => ({
+            label: extension.name,
+            description: formatPathForWorkspace(extension.path, workspaceFolder),
+            detail: extension.path,
+            path: extension.path,
+            picked: selectedPaths.some((item) => isSamePath(item, extension.path))
           })),
-        {
-          label: "$(folder-opened) Добавить каталоги вне рабочей области…",
-          description: "Каждый каталог должен содержать Configuration.xml",
-          browse: true
-        }
-      ],
+          ...selectedPaths
+            .filter((item) => !knownByPath.has(item))
+            .map((item) => ({
+              label: `$(folder) ${path.basename(item)}`,
+              description: "Выбранный внешний каталог",
+              detail: item,
+              path: item,
+              picked: true
+            })),
+          {
+            label: "$(folder-opened) Добавить каталоги вне рабочей области…",
+            description: "Каждый каталог должен содержать Configuration.xml",
+            browse: true
+          }
+        ],
       {
         title: "1C: Исходники расширений",
-        placeHolder: "Необязательно: выберите расширения, которые нужно отлаживать",
-        canPickMany: true
+        placeHolder: hasOnlyExternalChoices
+          ? "Расширения не найдены в рабочей области"
+          : "Необязательно: выберите расширения, которые нужно отлаживать",
+        canPickMany: !hasOnlyExternalChoices
       }
     );
     if (!selected) {
       return undefined;
     }
-    const selectedItems = selected.filter((item) => !item.browse);
+    if (!Array.isArray(selected) && selected.continueWithoutExtensions) {
+      return [];
+    }
+    const selectedItems = (Array.isArray(selected) ? selected : [selected])
+      .filter((item) => !item.browse);
     selectedPaths = selectedItems.map((item) => item.path);
-    if (selected.some((item) => item.browse)) {
+    const isBrowseSelected = (Array.isArray(selected) ? selected : [selected])
+      .some((item) => item.browse);
+    if (isBrowseSelected) {
       const additional = await pickDirectory(
         "1C: Дополнительные исходники расширений",
         workspaceFolder.uri,
@@ -287,6 +302,7 @@ async function chooseExtensions(workspaceFolder, baseProject) {
       return extensions;
     } catch (error) {
       await vscode.window.showErrorMessage(`Не удалось добавить расширение: ${error.message}`);
+      selectedPaths = [];
     }
   }
 }
