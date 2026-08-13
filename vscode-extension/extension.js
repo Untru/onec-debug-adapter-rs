@@ -67,20 +67,30 @@ function configuredAutoAttachTypes(session) {
 
 async function configurationRoot(directory) {
   const canonical = await canonicalDirectory(directory);
-  const descriptor = path.join(canonical, "Configuration.xml");
-  const stat = await fs.promises.stat(descriptor).catch(() => undefined);
-  if (!stat?.isFile()) {
-    throw new Error("В каталоге не найден файл Configuration.xml.");
+  const xmlDescriptor = path.join(canonical, "Configuration.xml");
+  const edtManifest = path.join(canonical, "DT-INF", "PROJECT.PMF");
+  const edtDescriptor = path.join(canonical, "src", "Configuration", "Configuration.mdo");
+  const [xml, manifest, edt] = await Promise.all(
+    [xmlDescriptor, edtManifest, edtDescriptor].map((item) => fs.promises.stat(item).catch(() => undefined))
+  );
+  if (!xml?.isFile() && !(manifest?.isFile() && edt?.isFile())) {
+    throw new Error("В каталоге не найден Configuration.xml или EDT-проект (DT-INF/PROJECT.PMF и src/Configuration/Configuration.mdo).");
   }
   return canonical;
 }
 
 async function extensionRoot(directory) {
   const root = await configurationRoot(directory);
-  const xml = await fs.promises.readFile(path.join(root, "Configuration.xml"), "utf8");
-  const name = parseExtensionName(xml);
+  const edt = await fs.promises.stat(path.join(root, "DT-INF", "PROJECT.PMF")).catch(() => undefined);
+  const descriptor = edt?.isFile()
+    ? path.join(root, "src", "Configuration", "Configuration.mdo")
+    : path.join(root, "Configuration.xml");
+  const xml = await fs.promises.readFile(descriptor, "utf8");
+  const name = edt?.isFile()
+    ? xml.match(/<name\b[^>]*>\s*([^<]+?)\s*<\/name>/i)?.[1]?.trim()
+    : parseExtensionName(xml);
   if (!name) {
-    throw new Error("Не удалось прочитать <Properties><Name> из Configuration.xml.");
+    throw new Error("Не удалось прочитать имя конфигурации или расширения из исходников.");
   }
   return { name, path: root };
 }
@@ -91,7 +101,9 @@ async function discoverConfigurationRoots(root) {
   while (directories.length) {
     const directory = directories.pop();
     const entries = await fs.promises.readdir(directory, { withFileTypes: true }).catch(() => []);
-    if (entries.some((entry) => entry.isFile() && entry.name === "Configuration.xml")) {
+    if (entries.some((entry) => entry.isFile() && entry.name === "Configuration.xml")
+      || (entries.some((entry) => entry.isDirectory() && entry.name === "DT-INF")
+        && entries.some((entry) => entry.isFile() && entry.name === ".project"))) {
       candidates.push(directory);
     }
     for (const entry of entries) {
@@ -181,13 +193,13 @@ async function chooseBaseProject(workspaceFolder) {
       })),
       {
         label: "$(folder-opened) Выбрать другой каталог…",
-        description: "Каталог должен содержать Configuration.xml",
+        description: "Configuration.xml или EDT-проект",
         browse: true
       }
     ],
     {
       title: "1C: Исходники основной конфигурации",
-      placeHolder: "Выберите каталог с Configuration.xml"
+      placeHolder: "Выберите каталог с Configuration.xml или EDT-проектом"
     }
   );
   if (!picked) {
@@ -266,7 +278,7 @@ async function chooseExtensionsManually(workspaceFolder, baseProject) {
             })),
           {
             label: "$(folder-opened) Добавить каталоги вне рабочей области…",
-            description: "Каждый каталог должен содержать Configuration.xml",
+            description: "Каждый каталог должен быть XML-выгрузкой или EDT-проектом",
             browse: true
           }
         ],
@@ -351,7 +363,7 @@ async function chooseExtensionSource(workspaceFolder, extensionName, candidates)
           })),
         {
           label: "$(folder-opened) Выбрать каталог…",
-          description: "Каталог должен содержать Configuration.xml",
+          description: "Каталог должен быть XML-выгрузкой или EDT-проектом",
           browse: true
         },
         {

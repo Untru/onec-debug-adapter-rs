@@ -108,7 +108,7 @@
             "properties": {
               "rootProject": {
                 "type": "string",
-                "description": "Base configuration source root containing Configuration.xml; required to map BSL breakpoints"
+                "description": "Base XML export (Configuration.xml) or EDT project (DT-INF/PROJECT.PMF and src/Configuration/Configuration.mdo); required to map BSL breakpoints"
               },
               "platformPath": {
                 "type": "string",
@@ -201,7 +201,7 @@
               },
               "extensions": {
                 "type": "array",
-                "description": "Extension source roots, each containing Configuration.xml; extension names must be unique"
+                "description": "Extension XML exports or EDT project roots; extension names must be unique"
               },
               "autoAttachTypes": {
                 "type": "array",
@@ -246,7 +246,7 @@
             "properties": {
               "rootProject": {
                 "type": "string",
-                "description": "Base configuration source root containing Configuration.xml; required to map BSL breakpoints"
+                "description": "Base XML export (Configuration.xml) or EDT project (DT-INF/PROJECT.PMF and src/Configuration/Configuration.mdo); required to map BSL breakpoints"
               },
               "platformPath": {
                 "type": "string",
@@ -276,7 +276,7 @@
               },
               "extensions": {
                 "type": "array",
-                "description": "Extension source roots, each containing Configuration.xml; extension names must be unique"
+                "description": "Extension XML exports or EDT project roots; extension names must be unique"
               },
               "autoAttachTypes": {
                 "type": "array",
