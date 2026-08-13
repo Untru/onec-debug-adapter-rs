@@ -334,6 +334,7 @@ fn launch_debuggee(
 fn launch_standalone_server(
     arguments: &ConnectionArguments,
     info_base_target: &InfoBaseTarget,
+    debug_server: &DebugServer,
 ) -> Result<Child> {
     let platform_path = arguments
         .platform_path
@@ -387,10 +388,10 @@ fn launch_standalone_server(
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("1960:1991");
     let ssh_port = arguments.standalone_server_ssh_port.unwrap_or(1943);
-    let debug_host = arguments.debug_server_host.trim();
-    if debug_host.is_empty() {
-        anyhow::bail!("standaloneServer launch requires debugServerHost");
-    }
+    let debugger_url = debug_server
+        .endpoint()
+        .strip_suffix("/e1crdbg")
+        .unwrap_or(debug_server.endpoint());
     let mut command = Command::new(&executable);
     command
         .arg(format!("--database-path={}", database_path.display()))
@@ -404,9 +405,11 @@ fn launch_standalone_server(
         command.arg(format!("--data={data_path}"));
     }
     command
-        .arg("--debug=http")
-        .arg(format!("--debug-address={debug_host}"))
-        .arg(format!("--debug-port={}", arguments.debug_server_port))
+        // `ibsrv` does not expose the RDBG HTTP endpoint itself in a way a
+        // DAP adapter can attach to.  Its `server` mode registers the base at
+        // the temporary `dbgs` sidecar, exactly like `1cv8c -attach`.
+        .arg("--debug=server")
+        .arg(format!("--debug-server-url={debugger_url}"))
         .spawn()
         .with_context(|| format!("cannot start 1C standalone server {}", executable.display()))
 }
@@ -1002,29 +1005,22 @@ impl Adapter {
         }
         let trace_info_base = info_base.alias.clone();
         let launch_mode = arguments.launch_mode;
-        let mut standalone_server =
-            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
-                Some(launch_standalone_server(&arguments, &info_base)?)
-            } else {
-                None
-            };
-        let mut spawned_debug_server =
-            if launch && info_base.is_file && arguments.launch_mode == LaunchMode::Client {
-                let platform_path = arguments
-                    .platform_path
-                    .as_deref()
-                    .context("launch requires platformPath for a file infobase")?;
-                let platform_bin = platform_bin(
-                    &PathBuf::from(platform_path),
-                    arguments.platform_version.as_deref(),
-                )?;
-                Some(launch_file_debug_server(
-                    &platform_bin,
-                    &arguments.debug_server_host,
-                )?)
-            } else {
-                None
-            };
+        let mut spawned_debug_server = if launch && info_base.is_file {
+            let platform_path = arguments
+                .platform_path
+                .as_deref()
+                .context("launch requires platformPath for a file infobase")?;
+            let platform_bin = platform_bin(
+                &PathBuf::from(platform_path),
+                arguments.platform_version.as_deref(),
+            )?;
+            Some(launch_file_debug_server(
+                &platform_bin,
+                &arguments.debug_server_host,
+            )?)
+        } else {
+            None
+        };
         let server = spawned_debug_server
             .as_ref()
             .map(|spawned| spawned.server.clone())
@@ -1032,6 +1028,20 @@ impl Adapter {
                 &arguments.debug_server_host,
                 arguments.debug_server_port,
             )?);
+        let mut standalone_server =
+            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+                match launch_standalone_server(&arguments, &info_base, &server) {
+                    Ok(server) => Some(server),
+                    Err(error) => {
+                        if let Some(spawned) = &mut spawned_debug_server {
+                            terminate_child(&mut spawned.child);
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
         let attach_result = if standalone_server.is_some() {
             attach_debug_ui_after_startup(&server, &info_base.alias)
         } else {
