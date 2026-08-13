@@ -8,14 +8,18 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
 
 ## Installing a release VSIX
 
-1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases). The current published prerelease is `v0.1.0-alpha.23`.
+1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases). The current published prerelease is `v0.1.0-alpha.28`.
 2. In VS Code, open **Extensions** → `…` → **Install from VSIX…**, or run:
 
    ```sh
    code --install-extension onec-debug-native-<target>.vsix
    ```
 
-3. Add a minimal `.vscode/launch.json`:
+3. Run **1C: Настроить отладку…** from the Command Palette. The wizard validates the main configuration, lets you select any number of extension source directories, and writes a separate configuration to the selected workspace folder’s `.vscode/launch.json`. Existing launch configurations are preserved.
+
+   In a multi-root workspace, first choose the folder that should receive `launch.json`. Extension candidates are found only within that workspace folder; use **Добавить каталоги вне рабочей области…** if an extension’s sources live elsewhere. The wizard keeps no credentials and does not enable tracing.
+
+4. Alternatively, add a minimal `.vscode/launch.json` yourself:
 
    ```json
    {

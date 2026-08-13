@@ -16,8 +16,13 @@
     "Debuggers"
   ],
   "main": "./extension.js",
+  "scripts": {
+    "check": "node --check extension.js && node --check setup-wizard.js",
+    "test": "node --test test/*.test.js"
+  },
   "activationEvents": [
-    "onDebug"
+    "onDebug",
+    "onCommand:onec.configureDebugger"
   ],
   "contributes": {
     "configuration": {
@@ -40,12 +45,15 @@
       "debug": [
         {
           "id": "debug.debugTargets",
-          "name": "Цели отладки",
-          "when": "debugState != inactive"
+          "name": "Цели отладки"
         }
       ]
     },
     "commands": [
+      {
+        "command": "onec.configureDebugger",
+        "title": "1C: Настроить отладку…"
+      },
       {
         "command": "debug.debugTargets.connect",
         "title": "Подключить к цели отладки"
@@ -56,6 +64,11 @@
       }
     ],
     "menus": {
+      "commandPalette": [
+        {
+          "command": "onec.configureDebugger"
+        }
+      ],
       "view/title": [
         {
           "command": "debug.debugTargets.refresh",
@@ -71,6 +84,13 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "debug.debugTargets",
+        "when": "debugState == inactive",
+        "contents": "Настройте первую конфигурацию 1С для запуска или подключения.\n[Настроить отладку…](command:onec.configureDebugger)"
+      }
+    ],
     "debuggers": [
       {
         "type": "onec",
