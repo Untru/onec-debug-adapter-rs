@@ -30,8 +30,8 @@ async function designerExecutable(platformDirectory, options = {}) {
 }
 
 function validateConnection(connection) {
-  if (!connection || (connection.kind !== "file" && connection.kind !== "registered")) {
-    throw new Error("Для чтения расширений укажите файловую или зарегистрированную информационную базу.");
+  if (!connection || !["file", "registered", "server"].includes(connection.kind)) {
+    throw new Error("Для чтения расширений укажите файловую, серверную или зарегистрированную информационную базу.");
   }
   if (typeof connection.value !== "string" || !connection.value.trim()) {
     throw new Error("Не указана информационная база.");
@@ -46,7 +46,7 @@ function designerArguments(connection, resultFile) {
   const checked = validateConnection(connection);
   return [
     "DESIGNER",
-    checked.kind === "file" ? "/F" : "/IBName",
+    checked.kind === "file" ? "/F" : checked.kind === "server" ? "/S" : "/IBName",
     checked.value,
     "/DisableStartupMessages",
     "/DumpDBCfgList",

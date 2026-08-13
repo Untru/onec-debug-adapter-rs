@@ -55,7 +55,7 @@ Connect=File="/Users/me/1c/demo";
 [Серверная база]
 Connect=Srvr="srv-1c";Ref="Accounting";
 
-[Не переносить пароль]
+[Сохранённые учётные данные]
 Connect=Srvr="srv-1c";Ref="Secret";Usr="admin";Pwd="secret";
 `);
   assert.deepEqual(entries, [
@@ -64,14 +64,24 @@ Connect=Srvr="srv-1c";Ref="Secret";Usr="admin";Pwd="secret";
       kind: "file",
       filePath: "/Users/me/1c/demo",
       server: undefined,
-      reference: undefined
+      reference: undefined,
+      hasStoredCredentials: false
     },
     {
       name: "Серверная база",
       kind: "server",
       filePath: undefined,
       server: "srv-1c",
-      reference: "Accounting"
+      reference: "Accounting",
+      hasStoredCredentials: false
+    },
+    {
+      name: "Сохранённые учётные данные",
+      kind: "server",
+      filePath: undefined,
+      server: "srv-1c",
+      reference: "Secret",
+      hasStoredCredentials: true
     }
   ]);
 });
@@ -84,11 +94,23 @@ test("discovers ibases from standard files and keeps no credentials", async () =
   await fs.writeFile(second, "[Shared]\nConnect=File=\"/tmp/second\";\n[Secure]\nConnect=Srvr=\"host\";Ref=\"db\";Pwd=\"no\";");
   try {
     const entries = await discoverIbaseEntries({ files: [first, second] });
-    assert.deepEqual(entries.map((entry) => [entry.name, entry.filePath]), [
-      ["Safe", "/tmp/safe"],
-      ["Shared", "/tmp/first"]
+    assert.deepEqual(entries.map((entry) => [entry.name, entry.filePath, entry.hasStoredCredentials]), [
+      ["Safe", "/tmp/safe", false],
+      ["Secure", undefined, true],
+      ["Shared", "/tmp/first", false]
     ]);
-    assert.equal(entries.some((entry) => entry.name === "Secure"), false);
+    const secure = entries.find((entry) => entry.name === "Secure");
+    assert.deepEqual(secure, {
+      name: "Secure",
+      kind: "server",
+      filePath: undefined,
+      server: "host",
+      reference: "db",
+      hasStoredCredentials: true,
+      sourceFile: second
+    });
+    assert.equal(JSON.stringify(entries).includes("Pwd"), false);
+    assert.equal(JSON.stringify(entries).includes("no\""), false);
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
@@ -172,6 +194,14 @@ test("builds a read-only Designer command for a file infobase", () => {
       "/tmp/result.txt"
     ]
   );
+});
+
+test("builds a read-only Designer command for a server infobase", () => {
+  const args = designerArguments(
+    { kind: "server", value: "srv-1c\\accounting" },
+    "/tmp/result.txt"
+  );
+  assert.deepEqual(args.slice(0, 4), ["DESIGNER", "/S", "srv-1c\\accounting", "/DisableStartupMessages"]);
 });
 
 test("reads localized and plain extension names from Designer result", () => {
