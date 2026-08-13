@@ -233,10 +233,10 @@ struct ConnectionArguments {
     trace_file: Option<String>,
 }
 
-/// The process that owns the application being debugged.  `client` keeps the
+/// The process that owns the application being debugged. `client` keeps the
 /// established behaviour: start a local `dbgs` for a file base and then start
-/// `1cv8c`.  `standaloneServer` starts the platform's `ibsrv` with its HTTP
-/// debugger enabled; it is intended for a local web-client/server scenario.
+/// `1cv8c`. `standaloneServer` starts `ibsrv`, then starts the thin client
+/// against its HTTP endpoint.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum LaunchMode {
@@ -301,7 +301,9 @@ fn launch_debuggee(
         .unwrap_or(server.endpoint());
     let mut command = Command::new(&executable);
     command.arg("ENTERPRISE");
-    if let Some(path) = &info_base_target.direct_file_path {
+    if arguments.launch_mode == LaunchMode::StandaloneServer {
+        command.arg("/WS").arg(standalone_server_url(arguments));
+    } else if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
     } else {
         command.args([
@@ -329,6 +331,25 @@ fn launch_debuggee(
         ])
         .spawn()
         .with_context(|| format!("cannot start 1C client {}", executable.display()))
+}
+
+fn standalone_server_url(arguments: &ConnectionArguments) -> String {
+    let host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("localhost");
+    let port = arguments.standalone_server_port.unwrap_or(8314);
+    let base = arguments
+        .standalone_server_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "/");
+    match base {
+        Some(base) if base.starts_with('/') => format!("http://{host}:{port}{base}"),
+        Some(base) => format!("http://{host}:{port}/{base}"),
+        None => format!("http://{host}:{port}"),
+    }
 }
 
 fn launch_standalone_server(
@@ -1082,11 +1103,10 @@ impl Adapter {
         self.debug_session = Some(session);
         self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
         self.standalone_server = standalone_server;
-        self.pending_debuggee =
-            (launch && arguments.launch_mode == LaunchMode::Client).then_some(PendingDebuggee {
-                arguments,
-                info_base,
-            });
+        self.pending_debuggee = launch.then_some(PendingDebuggee {
+            arguments,
+            info_base,
+        });
         // Do not replace a held ping with a new one: RDBG can leave the
         // original server-side request alive after its client disconnects.
         // Session replacement is not expected while attached; if it occurs,
@@ -2531,7 +2551,7 @@ mod tests {
                     root_project: None,
                     platform_path: None,
                     platform_version: None,
-                    launch_mode: LaunchMode::Client,
+                    launch_mode: LaunchMode::StandaloneServer,
                     standalone_server_host: None,
                     standalone_server_port: None,
                     standalone_server_base: None,
@@ -2882,6 +2902,28 @@ Connect=File="/tmp/demo";
 
         let default_arguments: ConnectionArguments = serde_json::from_value(json!({})).unwrap();
         assert_eq!(default_arguments.launch_mode, LaunchMode::Client);
+    }
+
+    #[test]
+    fn builds_a_thin_client_url_for_the_standalone_server() {
+        let root: ConnectionArguments = serde_json::from_value(json!({
+            "standaloneServerHost": "127.0.0.1",
+            "standaloneServerPort": 8315,
+            "standaloneServerBase": "/"
+        }))
+        .unwrap();
+        assert_eq!(standalone_server_url(&root), "http://127.0.0.1:8315");
+
+        let published: ConnectionArguments = serde_json::from_value(json!({
+            "standaloneServerHost": "localhost",
+            "standaloneServerPort": 8320,
+            "standaloneServerBase": "demo"
+        }))
+        .unwrap();
+        assert_eq!(
+            standalone_server_url(&published),
+            "http://localhost:8320/demo"
+        );
     }
 
     #[test]
