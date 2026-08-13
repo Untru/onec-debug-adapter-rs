@@ -263,6 +263,21 @@ test("cleans private Designer output after reading extension inventory", async (
   }
 });
 
+test("uses Designer standard output when a platform version does not create /Out", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-inventory-stdout-"));
+  try {
+    const names = await discoverInfoBaseExtensions({
+      executable: "/mock/1cv8",
+      tempRoot: temporary,
+      connection: { kind: "registered", value: "Demo" },
+      run: async () => Buffer.from("Extension: Stdout_Only\n")
+    });
+    assert.deepEqual(names, ["Stdout_Only"]);
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
 test("discovers a runnable Windows platform under Program Files style root", async () => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-platform-win-"));
   const root = path.join(temporary, "1cv8");

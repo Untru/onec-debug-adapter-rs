@@ -6,6 +6,7 @@ const path = require("node:path");
 const { hasCredentials } = require("./setup-wizard");
 
 const DEFAULT_TIMEOUT_MS = 45_000;
+const MAX_CAPTURED_OUTPUT_BYTES = 1_048_576;
 
 function executableName(platform = process.platform) {
   return platform === "win32" ? "1cv8.exe" : "1cv8";
@@ -105,13 +106,28 @@ function run(executable, args, options = {}) {
   const spawn = options.spawn ?? childProcess.spawn;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
+    const stdout = [];
+    let stdoutLength = 0;
     let child;
     try {
-      child = spawn(executable, args, { shell: false, windowsHide: true, stdio: "ignore" });
+      child = spawn(executable, args, {
+        shell: false,
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"]
+      });
     } catch (error) {
       reject(error);
       return;
     }
+    child.stdout?.on("data", (chunk) => {
+      // Some releases write DumpDBCfgList directly to stdout instead of the
+      // /Out file. Keep a bounded in-memory fallback, never log it.
+      if (stdoutLength >= MAX_CAPTURED_OUTPUT_BYTES) return;
+      const remaining = MAX_CAPTURED_OUTPUT_BYTES - stdoutLength;
+      const accepted = Buffer.from(chunk).subarray(0, remaining);
+      stdout.push(accepted);
+      stdoutLength += accepted.length;
+    });
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -128,7 +144,7 @@ function run(executable, args, options = {}) {
       } else if (code !== 0) {
         reject(new Error("Не удалось прочитать список расширений из информационной базы."));
       } else {
-        resolve();
+        resolve(Buffer.concat(stdout));
       }
     });
   });
@@ -146,8 +162,12 @@ async function discoverInfoBaseExtensions(options) {
   const outputFile = path.join(temporary, "designer-result.txt");
   try {
     const executable = options.executable ?? await designerExecutable(options.platformDirectory, options);
-    await (options.run ?? run)(executable, designerArguments(options.connection, outputFile), options);
-    const output = await fileSystem.readFile(outputFile).catch(() => Buffer.alloc(0));
+    const standardOutput = await (options.run ?? run)(
+      executable,
+      designerArguments(options.connection, outputFile),
+      options
+    );
+    const output = await fileSystem.readFile(outputFile).catch(() => standardOutput ?? Buffer.alloc(0));
     return parseDesignerExtensionList(output);
   } finally {
     await fileSystem.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
@@ -156,6 +176,7 @@ async function discoverInfoBaseExtensions(options) {
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
+  MAX_CAPTURED_OUTPUT_BYTES,
   decodeDesignerOutput,
   designerArguments,
   designerExecutable,
