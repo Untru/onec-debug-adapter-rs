@@ -108,7 +108,7 @@
             "properties": {
               "rootProject": {
                 "type": "string",
-                "description": "Directory containing the unpacked 1C configuration"
+                "description": "Base configuration source root containing Configuration.xml; required to map BSL breakpoints"
               },
               "platformPath": {
                 "type": "string",
@@ -138,7 +138,7 @@
               },
               "extensions": {
                 "type": "array",
-                "description": "Directories of configuration extensions"
+                "description": "Extension source roots, each containing Configuration.xml; extension names must be unique"
               },
               "autoAttachTypes": {
                 "type": "array",
@@ -183,7 +183,7 @@
             "properties": {
               "rootProject": {
                 "type": "string",
-                "description": "Directory containing the unpacked 1C configuration"
+                "description": "Base configuration source root containing Configuration.xml; required to map BSL breakpoints"
               },
               "platformPath": {
                 "type": "string",
@@ -213,7 +213,7 @@
               },
               "extensions": {
                 "type": "array",
-                "description": "Directories of configuration extensions"
+                "description": "Extension source roots, each containing Configuration.xml; extension names must be unique"
               },
               "autoAttachTypes": {
                 "type": "array",

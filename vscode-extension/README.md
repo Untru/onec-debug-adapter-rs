@@ -8,7 +8,7 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
 
 ## Installing a release VSIX
 
-1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases). The current published prerelease is `v0.1.0-alpha.28`.
+1. Download the matching `onec-debug-native-<target>.vsix` from [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases).
 2. In VS Code, open **Extensions** → `…` → **Install from VSIX…**, or run:
 
    ```sh
@@ -18,6 +18,8 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
 3. Run **1C: Настроить отладку…** from the Command Palette. The wizard validates the main configuration, lets you select any number of extension source directories, and writes a separate configuration to the selected workspace folder’s `.vscode/launch.json`. Existing launch configurations are preserved.
 
    In a multi-root workspace, first choose the folder that should receive `launch.json`. Extension candidates are found only within that workspace folder; use **Добавить каталоги вне рабочей области…** if an extension’s sources live elsewhere. The wizard keeps no credentials and does not enable tracing.
+
+   `rootProject` is the source root of the base configuration and must contain `Configuration.xml`. Every selected extension source root must also contain `Configuration.xml`; its `Properties/Name` must match the name of the extension installed in the infobase. Duplicate paths and duplicate extension names are rejected before the configuration is written.
 
 4. Alternatively, add a minimal `.vscode/launch.json` yourself:
 
@@ -32,7 +34,10 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
          "rootProject": "/absolute/path/to/unpacked-configuration",
          "platformPath": "/absolute/path/to/1c-platform-versions",
          "platformVersion": "LATEST",
-         "infoBase": "/absolute/path/to/file-infobase"
+         "infoBase": "/absolute/path/to/file-infobase",
+         "extensions": [
+           "/absolute/path/to/unpacked-configuration-extension"
+         ]
        }
      ]
    }
@@ -40,4 +45,6 @@ Release VSIX files bundle the native adapter for their target OS/architecture. F
 
 Do not install this extension and the original `vsc-onec-debug-adapter` together: both register `type: "onec"`.
 
-The adapter supports attach and launch, source/conditional/hit-count/log breakpoints, runtime-error breakpoints, stepping, stack frames, local variables and expression evaluation. `launch` starts the platform's `1cv8c` client from `platformPath`; `attach` expects an already available 1C debug server. For an unregistered file infobase, set `infoBase` to its absolute directory path or `File="/path/to/ib";`; launch uses `/F` and does not modify the user's 1C launcher list.
+The adapter supports attach and launch, source/conditional/hit-count/log breakpoints, runtime-error breakpoints, stepping, stack frames, local variables and expression evaluation. `launch` starts the platform's `1cv8c` client from `platformPath`; `attach` expects an already available 1C debug server. Both requests require `rootProject` for reliable BSL source mapping, breakpoints and source navigation; `attach` does not need `platformPath` because it does not start the platform. For an unregistered file infobase, set `infoBase` to its absolute directory path or `File="/path/to/ib";`; launch uses `/F` and does not modify the user's 1C launcher list.
+
+On macOS, select the server-platform directory that contains both `1cv8c` and `dbgs`, normally `/opt/1cv8/<version>` (for example `/opt/1cv8/8.3.27.1508`). A `1cv8.app` bundle and its `Contents/MacOS` directory only provide the GUI application and cannot be used for `launch`.

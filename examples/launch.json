@@ -5,6 +5,7 @@
       "name": "1C: Attach to debug server",
       "type": "onec",
       "request": "attach",
+      "rootProject": "/absolute/path/to/unpacked-configuration",
       "infoBase": "MyInfoBase",
       "debugServerHost": "localhost",
       "debugServerPort": 1550
@@ -17,6 +18,9 @@
       "platformPath": "/absolute/path/to/1c-platform-versions",
       "platformVersion": "LATEST",
       "infoBase": "MyInfoBase",
+      "extensions": [
+        "/absolute/path/to/unpacked-configuration-extension"
+      ],
       "debugServerHost": "localhost",
       "debugServerPort": 1550,
       "autoAttachTypes": [

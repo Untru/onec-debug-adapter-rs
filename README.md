@@ -38,14 +38,18 @@ cargo build --release
 
 ## Установка VSIX
 
-1. На странице [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases) скачайте файл `onec-debug-native-<target>.vsix` для своей ОС и архитектуры. Текущий опубликованный prerelease — `v0.1.0-alpha.23`.
+1. На странице [GitHub Releases](https://github.com/Untru/onec-debug-adapter-rs/releases) скачайте файл `onec-debug-native-<target>.vsix` для своей ОС и архитектуры.
 2. В VS Code откройте **Extensions**, нажмите `…` и выберите **Install from VSIX…**. Либо выполните:
 
    ```sh
    code --install-extension onec-debug-native-<target>.vsix
    ```
 
-3. Создайте `.vscode/launch.json`, например:
+3. В палитре команд VS Code запустите **«1C: Настроить отладку…»**. Мастер проверит исходники основной конфигурации, при необходимости предложит исходники расширений и создаст отдельную конфигурацию в `.vscode/launch.json`, не удаляя существующие.
+
+   В multi-root workspace сначала выбирается папка, в которой будет создан `launch.json`. Мастер ищет расширения только в этой папке; исходники расширения вне неё можно добавить через **«Добавить каталоги вне рабочей области…»**. Пароли, строки подключения с учётными данными и трассировка мастером не сохраняются.
+
+4. Либо создайте `.vscode/launch.json` вручную, например:
 
    ```json
    {
@@ -58,13 +62,22 @@ cargo build --release
          "rootProject": "/absolute/path/to/unpacked-configuration",
          "platformPath": "/absolute/path/to/1c-platform-versions",
          "platformVersion": "LATEST",
-         "infoBase": "/absolute/path/to/file-infobase"
+         "infoBase": "/absolute/path/to/file-infobase",
+         "extensions": [
+           "/absolute/path/to/unpacked-configuration-extension"
+         ]
        }
      ]
    }
    ```
 
 Не устанавливайте одновременно это расширение и оригинальный `vsc-onec-debug-adapter`: оба регистрируют `type: "onec"`.
+
+`rootProject` всегда указывает на каталог исходников основной конфигурации с `Configuration.xml`. Каждый путь в `extensions` должен указывать на корень исходников одного расширения, также содержащий `Configuration.xml`; имя в `Properties/Name` этого файла должно совпадать с именем расширения, установленного в информационной базе. Адаптер отклонит повторяющиеся пути и одинаковые имена расширений, чтобы точки останова не сопоставлялись неоднозначно.
+
+Для `attach` тоже указывайте `rootProject`: без него подключение возможно, но адаптер не сможет надёжно сопоставить BSL-файл с модулем в базе, поэтому точки останова и переход к исходнику не гарантируются. В `attach` не нужны `platformPath` и `platformVersion`, так как сервер отладки уже запущен.
+
+На macOS для `launch` выберите каталог установленной серверной части платформы, обычно `/opt/1cv8/<версия>` (например, `/opt/1cv8/8.3.27.1508`), содержащий `1cv8c` и `dbgs`. `1cv8.app` и его `Contents/MacOS` — GUI-пакет; в нём этих программ нет, поэтому он не подходит для запуска отладки.
 
 ## Совместимость с VS Code
 
