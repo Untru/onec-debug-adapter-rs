@@ -14,16 +14,17 @@ const {
   discoverPlatformDirectories,
   discoverIbaseEntries,
   discoverV8ProjectEntries,
+  fileInfoBaseArgument,
   hasCredentials,
   ibasesFilePickerChoice,
   isSamePath,
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
-  parseServerInfoBaseConnection,
+  parseServerInfoBaseArgument,
   parseIbaseV8i,
   parseV8Project,
-  serverInfoBaseConnection,
+  serverInfoBaseArgument,
   uniqueConfigurationName,
   validatePlatformDirectory
 } = require("../setup-wizard");
@@ -92,14 +93,15 @@ test("recognizes credential-bearing connection strings", () => {
   assert.equal(hasCredentials("DemoBase"), false);
 });
 
-test("converts a selected server base to a credential-free direct connection", () => {
-  const connection = serverInfoBaseConnection("srv-1c", "Accounting");
-  assert.equal(connection, 'Srvr="srv-1c";Ref="Accounting";');
-  assert.deepEqual(parseServerInfoBaseConnection(connection), {
+test("converts selected bases to the native 1C /F and /S arguments", () => {
+  const connection = serverInfoBaseArgument("srv-1c", "Accounting");
+  assert.equal(fileInfoBaseArgument("/work/ib"), "/F /work/ib");
+  assert.equal(connection, "/Ssrv-1c\\Accounting");
+  assert.deepEqual(parseServerInfoBaseArgument(connection), {
     server: "srv-1c",
     reference: "Accounting"
   });
-  assert.equal(parseServerInfoBaseConnection('Srvr="srv-1c";'), undefined);
+  assert.equal(parseServerInfoBaseArgument("/Ssrv-1c"), undefined);
 });
 
 test("parses safe file and server entries from ibases.v8i", () => {

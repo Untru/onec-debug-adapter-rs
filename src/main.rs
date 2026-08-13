@@ -280,8 +280,9 @@ struct InfoBaseTarget {
     /// still starts registered bases via `/IBName`, while `ibsrv` needs the
     /// concrete directory passed to `--database-path`.
     registered_file_path: Option<PathBuf>,
-    /// A server connection supplied directly as `Srvr="host";Ref="base";`
-    /// or resolved from the launcher registration. It lets launch use `/S`
+    /// A server connection supplied directly as `/Shost\base` (the same form
+    /// used by the 1C client), `Srvr="host";Ref="base";`, or resolved from a
+    /// launcher registration. It lets launch use `/S`
     /// without relying on the mutable per-user launcher list.
     direct_server: Option<ServerInfoBase>,
 }
@@ -992,8 +993,9 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
 }
 
 fn direct_file_infobase_path(info_base: &str) -> Option<PathBuf> {
-    let path = extract_connection_property(info_base, "File")
+    let path = command_line_switch_value(info_base, "/F")
         .map(PathBuf::from)
+        .or_else(|| extract_connection_property(info_base, "File").map(PathBuf::from))
         .or_else(|| {
             let path = PathBuf::from(info_base.trim());
             path.is_dir().then_some(path)
@@ -1002,9 +1004,30 @@ fn direct_file_infobase_path(info_base: &str) -> Option<PathBuf> {
 }
 
 fn direct_server_infobase(info_base: &str) -> Option<ServerInfoBase> {
-    let server = extract_connection_property(info_base, "Srvr")?;
-    let reference = extract_connection_property(info_base, "Ref")?;
+    let direct = command_line_switch_value(info_base, "/S").and_then(|value| {
+        value
+            .split_once('\\')
+            .map(|(server, reference)| (server.to_owned(), reference.to_owned()))
+    });
+    let (server, reference) = direct.unwrap_or_else(|| {
+        (
+            extract_connection_property(info_base, "Srvr").unwrap_or_default(),
+            extract_connection_property(info_base, "Ref").unwrap_or_default(),
+        )
+    });
     (!server.is_empty() && !reference.is_empty()).then_some(ServerInfoBase { server, reference })
+}
+
+/// Reads a single value written in the same compact form as a 1C launch
+/// command, such as `/F /var/lib/ib` or `/Sserver\\base`.
+fn command_line_switch_value(value: &str, switch: &str) -> Option<String> {
+    let value = value.trim();
+    let prefix = value.get(..switch.len())?;
+    if !prefix.eq_ignore_ascii_case(switch) {
+        return None;
+    }
+    let remainder = value[switch.len()..].trim();
+    (!remainder.is_empty()).then(|| remainder.trim_matches('"').to_owned())
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -3214,8 +3237,9 @@ Connect=File="/tmp/demo";
         let directory =
             std::env::temp_dir().join(format!("onec-file-base-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        let direct = directory.to_string_lossy().into_owned();
-        let connection = format!("File=\"{direct}\";");
+        let file_path = directory.to_string_lossy().into_owned();
+        let direct = format!("/F {file_path}");
+        let connection = format!("File=\"{file_path}\";");
 
         assert_eq!(direct_file_infobase_path(&direct), Some(directory.clone()));
         assert_eq!(
@@ -3265,7 +3289,7 @@ Connect=File="/tmp/demo";
     #[test]
     fn recognizes_direct_server_infobases_without_a_launcher_registration() {
         let arguments: ConnectionArguments = serde_json::from_value(json!({
-            "infoBase": "Srvr=\"srv-1c\";Ref=\"Accounting\";"
+            "infoBase": "/Ssrv-1c\\Accounting"
         }))
         .unwrap();
         assert_eq!(

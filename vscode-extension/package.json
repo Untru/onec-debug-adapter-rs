@@ -175,7 +175,7 @@
               },
               "infoBase": {
                 "type": "string",
-                "description": "Absolute file-infobase directory or a server connection Srvr=\"server\";Ref=\"base\";"
+                "description": "Native 1C infobase argument: /F /absolute/path/to/ib or /Sserver\\base (double the backslash in JSON)"
               },
               "infoBaseAlias": {
                 "type": "string",
@@ -258,7 +258,7 @@
               },
               "infoBase": {
                 "type": "string",
-                "description": "Absolute file-infobase directory or a server connection Srvr=\"server\";Ref=\"base\";"
+                "description": "Native 1C infobase argument: /F /absolute/path/to/ib or /Sserver\\base (double the backslash in JSON)"
               },
               "infoBaseAlias": {
                 "type": "string",

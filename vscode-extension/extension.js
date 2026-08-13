@@ -6,6 +6,7 @@ const {
   canonicalDirectory,
   configurationSummary,
   defaultPlatformRoots,
+  fileInfoBaseArgument,
   discoverIbaseEntries,
   discoverV8ProjectEntries,
   discoverPlatformDirectories,
@@ -15,8 +16,8 @@ const {
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
-  parseServerInfoBaseConnection,
-  serverInfoBaseConnection,
+  parseServerInfoBaseArgument,
+  serverInfoBaseArgument,
   uniqueConfigurationName,
   isPlatformVersionDirectory,
   validatePlatformDirectory
@@ -545,7 +546,7 @@ async function chooseInfoBase(workspaceFolder) {
         },
         {
           label: "$(edit) Ввести серверное подключение…",
-          description: "Формат: Srvr=\"server\";Ref=\"base\"; без учётных данных",
+          description: "Формат: /Sserver\\base без учётных данных",
           manual: true
         }
       ],
@@ -577,7 +578,7 @@ async function chooseInfoBase(workspaceFolder) {
     if (selected.entry) {
       if (selected.entry.kind === "file" && selected.entry.filePath) {
         return {
-          infoBase: selected.entry.filePath,
+          infoBase: fileInfoBaseArgument(selected.entry.filePath),
           inventoryConnection: { kind: "file", value: selected.entry.filePath },
           supportsStandaloneServer: true
         };
@@ -585,7 +586,7 @@ async function chooseInfoBase(workspaceFolder) {
       if (selected.entry.kind === "server" && selected.entry.server && selected.entry.reference) {
         const connection = `${selected.entry.server}\\${selected.entry.reference}`;
         return {
-          infoBase: serverInfoBaseConnection(selected.entry.server, selected.entry.reference),
+          infoBase: serverInfoBaseArgument(selected.entry.server, selected.entry.reference),
           infoBaseAlias: selected.entry.reference,
           inventoryConnection: { kind: "server", value: connection },
           supportsStandaloneServer: false
@@ -599,18 +600,18 @@ async function chooseInfoBase(workspaceFolder) {
     if (selected.manual) {
       const infoBase = await inputInfoBase(
         "1C: Серверное подключение",
-        "Введите Srvr=\"server\";Ref=\"base\"; без логина и пароля"
+        "Введите /Sserver\\base без логина и пароля"
       );
       if (!infoBase) return undefined;
-      const server = parseServerInfoBaseConnection(infoBase);
+      const server = parseServerInfoBaseArgument(infoBase);
       if (!server) {
         await vscode.window.showErrorMessage(
-          "Нужно указать оба параметра: Srvr=\"server\";Ref=\"base\";."
+          "Нужно указать сервер и базу в формате /Sserver\\base."
         );
         continue;
       }
       return {
-        infoBase: serverInfoBaseConnection(server.server, server.reference),
+        infoBase: serverInfoBaseArgument(server.server, server.reference),
         infoBaseAlias: server.reference,
         inventoryConnection: { kind: "server", value: `${server.server}\\${server.reference}` },
         supportsStandaloneServer: false
@@ -621,7 +622,7 @@ async function chooseInfoBase(workspaceFolder) {
     try {
       const infoBase = await canonicalDirectory(directory);
       return {
-        infoBase,
+        infoBase: fileInfoBaseArgument(infoBase),
         inventoryConnection: { kind: "file", value: infoBase },
         supportsStandaloneServer: true
       };

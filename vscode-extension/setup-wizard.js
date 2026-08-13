@@ -41,12 +41,19 @@ function connectionProperty(connection, property) {
   return undefined;
 }
 
-function serverInfoBaseConnection(server, reference) {
-  const quote = (value) => String(value).replace(/"/g, '""');
-  return `Srvr="${quote(server)}";Ref="${quote(reference)}";`;
+function fileInfoBaseArgument(filePath) {
+  return `/F ${path.normalize(filePath)}`;
 }
 
-function parseServerInfoBaseConnection(connection) {
+function serverInfoBaseArgument(server, reference) {
+  return `/S${String(server)}\\${String(reference)}`;
+}
+
+function parseServerInfoBaseArgument(connection) {
+  const direct = typeof connection === "string" && connection.trim().match(/^\/S\s*(.+?)\\(.+)$/i);
+  if (direct) {
+    return { server: direct[1].trim().replace(/^"(.*)"$/, "$1"), reference: direct[2].trim().replace(/^"(.*)"$/, "$1") };
+  }
   const server = connectionProperty(connection, "Srvr");
   const reference = connectionProperty(connection, "Ref");
   return server && reference ? { server, reference } : undefined;
@@ -500,6 +507,7 @@ module.exports = {
   decodePlatformText,
   defaultIbaseDirectories,
   defaultIbaseFiles,
+  fileInfoBaseArgument,
   containsPlatformBinaries,
   defaultPlatformRoots,
   discoverIbaseEntries,
@@ -514,10 +522,10 @@ module.exports = {
   mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
-  parseServerInfoBaseConnection,
+  parseServerInfoBaseArgument,
   parseIbaseV8i,
   parseV8Project,
-  serverInfoBaseConnection,
+  serverInfoBaseArgument,
   platformBinaryDirectory,
   platformExecutables,
   readPlatformText,
