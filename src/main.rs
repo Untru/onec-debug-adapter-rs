@@ -42,6 +42,7 @@ struct Adapter {
     next_variable_reference: i64,
     variable_references: BTreeMap<i64, VariableReference>,
     pending_evaluations: BTreeMap<String, PendingEvaluation>,
+    auto_attach_types: HashSet<String>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
     trace: Option<LatencyTrace>,
@@ -143,6 +144,7 @@ impl Default for Adapter {
             next_variable_reference: 0,
             variable_references: BTreeMap::new(),
             pending_evaluations: BTreeMap::new(),
+            auto_attach_types: HashSet::new(),
             module_registry: None,
             module_breakpoints: BTreeMap::new(),
             trace: None,
@@ -1173,7 +1175,16 @@ impl Adapter {
         if !launch && arguments.launch_mode == LaunchMode::StandaloneServer {
             anyhow::bail!("launchMode standaloneServer requires request launch");
         }
-        let trace_info_base = info_base.alias.clone();
+        // `ibsrv` registers the autonomous infobase in dbgs under its
+        // published name, not under the original file-base `DefAlias`.
+        // The thin client uses that same name in `/S…\\<name>`.
+        let debug_info_base_alias =
+            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+                standalone_server_name(&arguments)
+            } else {
+                info_base.alias.clone()
+            };
+        let trace_info_base = debug_info_base_alias.clone();
         let launch_mode = arguments.launch_mode;
         let mut spawned_debug_server = if launch && info_base.is_file {
             let platform_path = arguments
@@ -1213,9 +1224,9 @@ impl Adapter {
                 None
             };
         let attach_result = if standalone_server.is_some() {
-            attach_debug_ui_after_startup(&server, &info_base.alias)
+            attach_debug_ui_after_startup(&server, &debug_info_base_alias)
         } else {
-            server.attach_debug_ui(&info_base.alias)
+            server.attach_debug_ui(&debug_info_base_alias)
         };
         let session = match attach_result {
             Ok(session) => session,
@@ -1247,6 +1258,7 @@ impl Adapter {
         );
         self.debug_server = Some(server);
         self.debug_session = Some(session);
+        self.auto_attach_types = auto_attach_types.iter().cloned().collect();
         self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
         self.standalone_server = standalone_server;
         self.pending_debuggee = launch.then_some(PendingDebuggee {
@@ -1322,6 +1334,7 @@ impl Adapter {
         self.call_stacks.clear();
         self.variable_references.clear();
         self.pending_evaluations.clear();
+        self.auto_attach_types.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
         self.pending_steps.clear();
@@ -1476,6 +1489,16 @@ impl Adapter {
                 )];
             }
         };
+        self.trace(
+            "dap.breakpoints.received",
+            json!({
+                "sourcePath": source_path,
+                "lineCount": breakpoints.len(),
+                "extensionName": module.extension_name.clone(),
+                "objectId": module.object_id.clone(),
+                "propertyId": module.property_id.clone(),
+            }),
+        );
         let key = (
             module.extension_name.clone(),
             module.object_id.clone(),
@@ -1509,12 +1532,20 @@ impl Adapter {
             )];
         };
         if let Err(error) = server.set_breakpoints(session, &modules) {
+            self.trace(
+                "rdbg.breakpoints.failed",
+                json!({ "sourcePath": source_path, "error": error.to_string() }),
+            );
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 error.to_string(),
             )];
         }
+        self.trace(
+            "rdbg.breakpoints.applied",
+            json!({ "sourcePath": source_path, "lineCount": breakpoints.len() }),
+        );
         vec![response(
             request,
             self.next_sequence(),
@@ -1881,10 +1912,12 @@ impl Adapter {
                 else {
                     return Vec::new();
                 };
-                events
+                let mut messages = events
                     .into_iter()
                     .flat_map(|debug_event| self.handle_debug_event(&server, &session, debug_event))
-                    .collect()
+                    .collect::<Vec<_>>();
+                messages.extend(self.reconcile_auto_attach_targets(&server, &session));
+                messages
             }
             Err(error) if !self.poll_failed => {
                 self.poll_failed = true;
@@ -1901,12 +1934,71 @@ impl Adapter {
         }
     }
 
+    /// Some platform/standalone-server combinations create a target before
+    /// the Debug UI begins listening and never replay `targetStarted`.  A
+    /// sequential reconciliation after each completed ping covers that loss
+    /// without issuing a second long-poll or attaching a disallowed target.
+    fn reconcile_auto_attach_targets(
+        &mut self,
+        server: &DebugServer,
+        session: &DebugUiSession,
+    ) -> Vec<Value> {
+        if self.auto_attach_types.is_empty() {
+            return Vec::new();
+        }
+        let targets = match server.get_debug_targets(session) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.trace(
+                    "rdbg.target.reconcile_failed",
+                    json!({ "error": error.to_string() }),
+                );
+                return vec![self.output_event(
+                    "stderr",
+                    format!("cannot refresh 1C debug targets: {error}\n"),
+                )];
+            }
+        };
+        self.trace(
+            "rdbg.target.reconciled",
+            json!({ "available": targets.len(), "attached": self.threads.len() }),
+        );
+        let candidates = targets
+            .into_iter()
+            .filter(|target| {
+                !self.threads.contains_key(&target.id)
+                    && self.auto_attach_types.contains(&target.target_type)
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .into_iter()
+            .flat_map(|target| {
+                self.handle_debug_event(
+                    server,
+                    session,
+                    DebugUiEvent {
+                        command_id: "targetStarted".to_owned(),
+                        target_id: Some(target.id),
+                        ..DebugUiEvent::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn handle_debug_event(
         &mut self,
         server: &DebugServer,
         session: &DebugUiSession,
         debug_event: DebugUiEvent,
     ) -> Vec<Value> {
+        self.trace(
+            "rdbg.event.received",
+            json!({
+                "command": debug_event.command_id.clone(),
+                "targetId": debug_event.target_id.clone(),
+            }),
+        );
         match (
             debug_event.command_id.as_str(),
             debug_event.target_id.clone(),
@@ -1916,6 +2008,10 @@ impl Adapter {
                     return Vec::new();
                 }
                 if let Err(error) = server.clear_break_on_next_statement(session) {
+                    self.trace(
+                        "rdbg.target.attach_failed",
+                        json!({ "targetId": target_id, "stage": "clearBreakOnNextStatement", "error": error.to_string() }),
+                    );
                     return vec![self.output_event(
                         "stderr",
                         format!("cannot clear 1C break-on-next-statement: {error}\n"),
@@ -1924,12 +2020,20 @@ impl Adapter {
                 if let Err(error) =
                     server.attach_debug_targets(session, std::slice::from_ref(&target_id))
                 {
+                    self.trace(
+                        "rdbg.target.attach_failed",
+                        json!({ "targetId": target_id, "stage": "attachDebugTarget", "error": error.to_string() }),
+                    );
                     return vec![
                         self.output_event("stderr", format!("cannot attach 1C target: {error}\n")),
                     ];
                 }
                 let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
-                self.threads.insert(target_id, thread_id);
+                self.threads.insert(target_id.clone(), thread_id);
+                self.trace(
+                    "rdbg.target.attached",
+                    json!({ "targetId": target_id, "threadId": thread_id }),
+                );
                 vec![
                     event(
                         self.next_sequence(),
@@ -3072,6 +3176,22 @@ Connect=File="/tmp/demo";
 
         let default_arguments: ConnectionArguments = serde_json::from_value(json!({})).unwrap();
         assert_eq!(default_arguments.launch_mode, LaunchMode::Client);
+    }
+
+    #[test]
+    fn uses_the_published_standalone_name_as_the_debugger_alias() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "/F /tmp/demo",
+            "launchMode": "standaloneServer",
+            "standaloneServerName": "onec-debug-demo",
+        }))
+        .unwrap();
+
+        assert_eq!(standalone_server_name(&arguments), "onec-debug-demo");
+        assert_eq!(
+            standalone_server_direct_connection(&arguments),
+            "/S127.0.0.1:1941\\onec-debug-demo"
+        );
     }
 
     #[test]
