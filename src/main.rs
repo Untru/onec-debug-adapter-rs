@@ -12,7 +12,7 @@ use debug_server::{
 use metadata::ModuleRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write, stderr};
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ struct Adapter {
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
     file_debug_server: Option<Child>,
+    standalone_server: Option<Child>,
     debuggee: Option<Child>,
     pending_debuggee: Option<PendingDebuggee>,
     debuggee_launcher: DebuggeeLauncher,
@@ -41,6 +42,7 @@ struct Adapter {
     next_variable_reference: i64,
     variable_references: BTreeMap<i64, VariableReference>,
     pending_evaluations: BTreeMap<String, PendingEvaluation>,
+    auto_attach_types: HashSet<String>,
     module_registry: Option<ModuleRegistry>,
     module_breakpoints: BTreeMap<(String, String, String), Vec<SourceBreakpoint>>,
     trace: Option<LatencyTrace>,
@@ -131,6 +133,7 @@ impl Default for Adapter {
             debug_server: None,
             debug_session: None,
             file_debug_server: None,
+            standalone_server: None,
             debuggee: None,
             pending_debuggee: None,
             debuggee_launcher: launch_debuggee,
@@ -141,6 +144,7 @@ impl Default for Adapter {
             next_variable_reference: 0,
             variable_references: BTreeMap::new(),
             pending_evaluations: BTreeMap::new(),
+            auto_attach_types: HashSet::new(),
             module_registry: None,
             module_breakpoints: BTreeMap::new(),
             trace: None,
@@ -212,14 +216,57 @@ struct ConnectionArguments {
     debug_server_port: u16,
     info_base: Option<String>,
     info_base_alias: Option<String>,
+    /// 1C user passed to a newly launched thin client as `/N`.
+    user_name: Option<String>,
+    /// 1C password passed to a newly launched thin client as `/P`.
+    ///
+    /// The adapter never sends this value to RDBG or writes it to traces.
+    /// Prefer a VS Code `${input:...}` value over literal text in launch.json.
+    password: Option<String>,
     root_project: Option<String>,
     platform_path: Option<String>,
     platform_version: Option<String>,
+    #[serde(default)]
+    launch_mode: LaunchMode,
+    standalone_server_host: Option<String>,
+    standalone_server_port: Option<u16>,
+    standalone_server_base: Option<String>,
+    standalone_server_data_path: Option<String>,
+    #[serde(default)]
+    standalone_server_transport: StandaloneServerTransport,
+    standalone_server_name: Option<String>,
+    standalone_server_direct_reg_port: Option<u16>,
+    standalone_server_direct_range: Option<String>,
+    standalone_server_ssh_port: Option<u16>,
     extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
     #[serde(default)]
     trace: bool,
     trace_file: Option<String>,
+}
+
+/// The process that owns the application being debugged. `client` keeps the
+/// established behaviour: start a local `dbgs` for a file base and then start
+/// `1cv8c`. `standaloneServer` starts `ibsrv`, then starts the thin client
+/// against either its direct TCP/IP gateway or its HTTP endpoint.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum LaunchMode {
+    #[default]
+    Client,
+    StandaloneServer,
+}
+
+/// Transport used by a thin client after the adapter starts `ibsrv`.
+///
+/// Direct TCP/IP is the safer local default: it avoids the HTTP login route
+/// while still using the thin client (not the browser web client).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum StandaloneServerTransport {
+    #[default]
+    Direct,
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +277,22 @@ struct InfoBaseTarget {
     /// entry, this must be passed to the client with `/F` and never requires
     /// registering the base in `ibases.v8i`.
     direct_file_path: Option<PathBuf>,
+    /// A file-base path resolved from a registered launcher entry.  It is
+    /// deliberately separate from `direct_file_path`: the ordinary client
+    /// still starts registered bases via `/IBName`, while `ibsrv` needs the
+    /// concrete directory passed to `--database-path`.
+    registered_file_path: Option<PathBuf>,
+    /// A server connection supplied directly as `/Shost\base` (the same form
+    /// used by the 1C client), `Srvr="host";Ref="base";`, or resolved from a
+    /// launcher registration. It lets launch use `/S`
+    /// without relying on the mutable per-user launcher list.
+    direct_server: Option<ServerInfoBase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServerInfoBase {
+    server: String,
+    reference: String,
 }
 
 const FILE_INFOBASE_ALIAS: &str = "DefAlias";
@@ -273,8 +336,22 @@ fn launch_debuggee(
         .unwrap_or(server.endpoint());
     let mut command = Command::new(&executable);
     command.arg("ENTERPRISE");
-    if let Some(path) = &info_base_target.direct_file_path {
+    if arguments.launch_mode == LaunchMode::StandaloneServer {
+        match arguments.standalone_server_transport {
+            StandaloneServerTransport::Direct => {
+                command.arg(standalone_server_direct_connection(arguments));
+            }
+            StandaloneServerTransport::Http => {
+                // The platform syntax is one token: `/WS"http://host:port"`.
+                // Passing `/WS` and the URL separately starts a client, but it does
+                // not form the standalone-server HTTP session correctly.
+                command.arg(format!("/WS{}", standalone_server_url(arguments)));
+            }
+        }
+    } else if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
+    } else if let Some(server) = &info_base_target.direct_server {
+        command.arg(direct_server_connection(server));
     } else {
         command.args([
             "/IBName",
@@ -284,6 +361,7 @@ fn launch_debuggee(
                 .context("launch requires infoBase")?,
         ]);
     }
+    append_client_credentials(&mut command, arguments)?;
     command
         .args([
             "/TCOMP",
@@ -301,6 +379,169 @@ fn launch_debuggee(
         ])
         .spawn()
         .with_context(|| format!("cannot start 1C client {}", executable.display()))
+}
+
+/// Adds optional 1C authentication switches without involving the debug
+/// server.  `/P` without `/N` is rejected early: the platform would otherwise
+/// show a less useful interactive login prompt after the debug session starts.
+fn append_client_credentials(command: &mut Command, arguments: &ConnectionArguments) -> Result<()> {
+    let user_name = arguments
+        .user_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let password = arguments
+        .password
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    if password.is_some() && user_name.is_none() {
+        anyhow::bail!("password requires userName");
+    }
+    if let Some(user_name) = user_name {
+        command.arg("/N").arg(user_name);
+    }
+    if let Some(password) = password {
+        command.arg("/P").arg(password);
+    }
+    Ok(())
+}
+
+fn standalone_server_url(arguments: &ConnectionArguments) -> String {
+    let host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    let port = arguments.standalone_server_port.unwrap_or(8314);
+    let base = arguments
+        .standalone_server_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "/");
+    match base {
+        Some(base) if base.starts_with('/') => format!("http://{host}:{port}{base}"),
+        Some(base) => format!("http://{host}:{port}/{base}"),
+        None => format!("http://{host}:{port}"),
+    }
+}
+
+fn standalone_server_name(arguments: &ConnectionArguments) -> String {
+    arguments
+        .standalone_server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "onec-debug-{}",
+                arguments.standalone_server_direct_reg_port.unwrap_or(1941)
+            )
+        })
+}
+
+fn standalone_server_direct_connection(arguments: &ConnectionArguments) -> String {
+    let host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    let registration_port = arguments.standalone_server_direct_reg_port.unwrap_or(1941);
+    format!(
+        "/S{host}:{registration_port}\\{}",
+        standalone_server_name(arguments)
+    )
+}
+
+fn direct_server_connection(server: &ServerInfoBase) -> String {
+    format!("/S{}\\{}", server.server, server.reference)
+}
+
+fn launch_standalone_server(
+    arguments: &ConnectionArguments,
+    info_base_target: &InfoBaseTarget,
+    debug_server: &DebugServer,
+) -> Result<Child> {
+    let platform_path = arguments
+        .platform_path
+        .as_deref()
+        .context("standaloneServer launch requires platformPath")?;
+    let platform_bin = platform_bin(
+        &PathBuf::from(platform_path),
+        arguments.platform_version.as_deref(),
+    )?;
+    let executable = platform_bin.join(if cfg!(windows) { "ibsrv.exe" } else { "ibsrv" });
+    if !executable.is_file() {
+        anyhow::bail!(
+            "1C standalone server executable was not found at {}",
+            executable.display()
+        );
+    }
+    let database_path = info_base_target
+        .direct_file_path
+        .as_ref()
+        .or(info_base_target.registered_file_path.as_ref())
+        .context("standaloneServer launch requires a file infobase")?;
+    if !database_path.is_dir() {
+        anyhow::bail!(
+            "standaloneServer database directory was not found at {}",
+            database_path.display()
+        );
+    }
+    let http_host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    let http_port = arguments.standalone_server_port.unwrap_or(8314);
+    let http_base = arguments
+        .standalone_server_base
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/");
+    let data_path = arguments
+        .standalone_server_data_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    // `ibsrv` otherwise claims the global default direct port.  Use an
+    // isolated default for debugger-owned standalone servers so a normal
+    // platform service (or another development tool) on 1541 does not make a
+    // selected standalone launch fail.  Do not enable its SSH endpoint by
+    // default: on macOS/Linux it requires a host key which ordinary debugging
+    // sessions neither need nor should create.
+    let direct_registration_port = arguments.standalone_server_direct_reg_port.unwrap_or(1941);
+    let direct_range = arguments
+        .standalone_server_direct_range
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("1960:1991");
+    let debugger_url = debug_server
+        .endpoint()
+        .strip_suffix("/e1crdbg")
+        .unwrap_or(debug_server.endpoint());
+    let mut command = Command::new(&executable);
+    command
+        .arg(format!("--database-path={}", database_path.display()))
+        .arg(format!("--http-address={http_host}"))
+        .arg(format!("--http-port={http_port}"))
+        .arg(format!("--http-base={http_base}"))
+        .arg(format!("--name={}", standalone_server_name(arguments)))
+        .arg(format!("--direct-regport={direct_registration_port}"))
+        .arg(format!("--direct-range={direct_range}"));
+    if let Some(ssh_port) = arguments.standalone_server_ssh_port {
+        command.arg(format!("--ssh-port={ssh_port}"));
+    }
+    if let Some(data_path) = data_path {
+        command.arg(format!("--data={data_path}"));
+    }
+    command
+        // `ibsrv` does not expose the RDBG HTTP endpoint itself in a way a
+        // DAP adapter can attach to.  Its `server` mode registers the base at
+        // the temporary `dbgs` sidecar, exactly like `1cv8c -attach`.
+        .arg("--debug=server")
+        .arg(format!("--debug-server-url={debugger_url}"))
+        .spawn()
+        .with_context(|| format!("cannot start 1C standalone server {}", executable.display()))
 }
 
 /// Starts the 1C RDBG sidecar used by a file infobase and waits until it
@@ -371,6 +612,24 @@ fn launch_file_debug_server(platform_bin: &Path, host: &str) -> Result<SpawnedDe
         server: DebugServer::new(host, port)?,
         child,
     })
+}
+
+/// `ibsrv` opens its debugger asynchronously after its process starts.  Keep
+/// the wait bounded and retry the exact same attach request; unlike long-poll
+/// event requests this is a short control request and never overlaps another
+/// Debug UI ping.
+fn attach_debug_ui_after_startup(server: &DebugServer, alias: &str) -> Result<DebugUiSession> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match server.attach_debug_ui(alias) {
+            Ok(session) => return Ok(session),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("standalone debug server did not start")))
+        .context("cannot connect to the standalone 1C debug server within 10 seconds")
 }
 
 fn debug_server_port_from_notification(notification: &str) -> Result<u16> {
@@ -478,15 +737,9 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
         .or(arguments.info_base_alias.as_deref())
         .context("launch/attach requires infoBase or infoBaseAlias")?;
     let direct_file_path = direct_file_infobase_path(info_base);
-    let launcher_target = direct_file_path
-        .is_none()
-        .then(|| {
-            ibases_paths().into_iter().find_map(|path| {
-                fs::read_to_string(path)
-                    .ok()
-                    .and_then(|contents| launcher_info_base(&contents, info_base))
-            })
-        })
+    let direct_server = direct_server_infobase(info_base);
+    let launcher_target = (direct_file_path.is_none() && direct_server.is_none())
+        .then(|| launcher_info_base_from_paths(&ibases_paths(), info_base))
         .flatten();
     let is_file = direct_file_path.is_some()
         || launcher_target
@@ -500,46 +753,199 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
             .as_deref()
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
+            .or_else(|| {
+                direct_server
+                    .as_ref()
+                    .map(|target| target.reference.clone())
+            })
             .or_else(|| launcher_target.as_ref().map(|target| target.alias.clone()))
             .unwrap_or_else(|| info_base.to_owned())
     };
+    let registered_file_path = launcher_target
+        .as_ref()
+        .and_then(|target| target.registered_file_path.clone());
+    let launcher_direct_server = launcher_target
+        .as_ref()
+        .and_then(|target| target.direct_server.clone());
     Ok(InfoBaseTarget {
         alias,
         is_file,
         direct_file_path,
+        registered_file_path,
+        direct_server: direct_server.or(launcher_direct_server),
     })
 }
 
 fn ibases_paths() -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+    let home_dir = std::env::var_os("HOME").map(PathBuf::from);
+    let app_data = std::env::var_os("APPDATA").map(PathBuf::from);
+    let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+    ibases_paths_from_startup_directories(launcher_startup_directories(
+        current_launcher_platform(),
+        home_dir.as_deref(),
+        app_data.as_deref(),
+        local_app_data.as_deref(),
+    ))
+}
+
+/// Directories used by 1C:Enterprise launcher to store a user's list of
+/// information bases.  Newer macOS/Linux installations use `.1C/1cestart`;
+/// the older locations remain intentionally supported for existing users.
+fn launcher_startup_directories(
+    platform: &str,
+    home_dir: Option<&Path>,
+    app_data: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Vec<PathBuf> {
+    match platform {
+        "windows" => [app_data, local_app_data]
+            .into_iter()
+            .flatten()
+            .map(|directory| directory.join("1C").join("1CEStart"))
+            .collect(),
+        "macos" => home_dir
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join(".1C").join("1cestart"),
+                    home.join("Library")
+                        .join("Application Support")
+                        .join("1C")
+                        .join("1CEStart"),
+                    home.join(".1cv8").join("1C").join("1CEStart"),
+                ]
+            })
+            .collect(),
+        _ => home_dir
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join(".1C").join("1cestart"),
+                    home.join(".1cv8").join("1C").join("1CEStart"),
+                ]
+            })
+            .collect(),
+    }
+}
+
+fn current_launcher_platform() -> &'static str {
     if cfg!(windows) {
-        if let Some(app_data) = std::env::var_os("APPDATA") {
-            paths.push(
-                PathBuf::from(app_data)
-                    .join("1C")
-                    .join("1CEStart")
-                    .join("ibases.v8i"),
-            );
-        }
-    } else if let Some(home_dir) = std::env::var_os("HOME") {
-        let home_dir = PathBuf::from(home_dir);
-        paths.push(
-            home_dir
-                .join(".1cv8")
-                .join("1C")
-                .join("1CEStart")
-                .join("ibases.v8i"),
-        );
-        paths.push(
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("1C")
-                .join("1CEStart")
-                .join("ibases.v8i"),
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "unix"
+    }
+}
+
+/// Finds the normal user list plus all lists configured by
+/// `CommonInfoBases` in each `1cestart.cfg`.  A common list can be an
+/// absolute path or a path relative to the launcher directory.
+fn ibases_paths_from_startup_directories(startup_directories: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut paths = startup_directories
+        .iter()
+        .map(|directory| directory.join("ibases.v8i"))
+        .collect::<Vec<_>>();
+    for directory in &startup_directories {
+        let config_path = directory.join("1cestart.cfg");
+        let Some(config) = read_platform_text(&config_path) else {
+            continue;
+        };
+        paths.extend(
+            common_info_base_list_paths(&config)
+                .into_iter()
+                .map(|value| {
+                    let path = PathBuf::from(value);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        directory.join(path)
+                    }
+                }),
         );
     }
+    unique_launcher_paths(paths)
+}
+
+fn unique_launcher_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
     paths
+        .into_iter()
+        .filter(|path| {
+            let normalized = path.to_string_lossy();
+            let key = if cfg!(windows) {
+                normalized.to_ascii_lowercase()
+            } else {
+                normalized.into_owned()
+            };
+            seen.insert(key)
+        })
+        .collect()
+}
+
+fn common_info_base_list_paths(config: &str) -> Vec<String> {
+    config
+        .lines()
+        .filter_map(|raw_line| {
+            let line = raw_line.trim();
+            let (key, value) = line.split_once('=')?;
+            key.trim()
+                .eq_ignore_ascii_case("CommonInfoBases")
+                .then_some(value)
+        })
+        .flat_map(|value| value.split(';'))
+        .map(str::trim)
+        .map(|path| path.trim_matches('"').trim())
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+/// 1C platform files are normally UTF-8, but the launcher also writes
+/// UTF-16LE (with a BOM) on some platform/OS combinations.
+fn read_platform_text(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    decode_platform_text(&bytes).ok()
+}
+
+fn decode_platform_text(bytes: &[u8]) -> Result<String> {
+    let text = match bytes {
+        [0xff, 0xfe, rest @ ..] => decode_utf16_platform_text(rest, true)?,
+        [0xfe, 0xff, rest @ ..] => decode_utf16_platform_text(rest, false)?,
+        [0xef, 0xbb, 0xbf, rest @ ..] => std::str::from_utf8(rest)
+            .context("1C launcher file is not valid UTF-8")?
+            .to_owned(),
+        _ => std::str::from_utf8(bytes)
+            .context("1C launcher file is not valid UTF-8")?
+            .to_owned(),
+    };
+    Ok(text)
+}
+
+fn decode_utf16_platform_text(bytes: &[u8], little_endian: bool) -> Result<String> {
+    let chunks = bytes.chunks_exact(2);
+    if !chunks.remainder().is_empty() {
+        anyhow::bail!("1C launcher file contains incomplete UTF-16 data");
+    }
+    let words = chunks
+        .map(|chunk| {
+            if little_endian {
+                u16::from_le_bytes([chunk[0], chunk[1]])
+            } else {
+                u16::from_be_bytes([chunk[0], chunk[1]])
+            }
+        })
+        .collect::<Vec<_>>();
+    String::from_utf16(&words).context("1C launcher file is not valid UTF-16")
+}
+
+fn launcher_info_base_from_paths(
+    paths: &[PathBuf],
+    info_base_name: &str,
+) -> Option<InfoBaseTarget> {
+    paths.iter().find_map(|path| {
+        read_platform_text(path).and_then(|contents| launcher_info_base(&contents, info_base_name))
+    })
 }
 
 fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarget> {
@@ -567,29 +973,63 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
             .to_ascii_lowercase()
             .starts_with("file=")
         {
+            let registered_file_path =
+                extract_connection_property(connect, "File").map(PathBuf::from);
             return Some(InfoBaseTarget {
                 alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
                 direct_file_path: None,
+                registered_file_path,
+                direct_server: None,
             });
         }
-        return extract_connection_property(connect, "Ref").map(|alias| InfoBaseTarget {
-            alias,
+        return direct_server_infobase(connect).map(|server| InfoBaseTarget {
+            alias: server.reference.clone(),
             is_file: false,
             direct_file_path: None,
+            registered_file_path: None,
+            direct_server: Some(server),
         });
     }
     None
 }
 
 fn direct_file_infobase_path(info_base: &str) -> Option<PathBuf> {
-    let path = extract_connection_property(info_base, "File")
+    let path = command_line_switch_value(info_base, "/F")
         .map(PathBuf::from)
+        .or_else(|| extract_connection_property(info_base, "File").map(PathBuf::from))
         .or_else(|| {
             let path = PathBuf::from(info_base.trim());
             path.is_dir().then_some(path)
         })?;
     path.is_dir().then_some(path)
+}
+
+fn direct_server_infobase(info_base: &str) -> Option<ServerInfoBase> {
+    let direct = command_line_switch_value(info_base, "/S").and_then(|value| {
+        value
+            .split_once('\\')
+            .map(|(server, reference)| (server.to_owned(), reference.to_owned()))
+    });
+    let (server, reference) = direct.unwrap_or_else(|| {
+        (
+            extract_connection_property(info_base, "Srvr").unwrap_or_default(),
+            extract_connection_property(info_base, "Ref").unwrap_or_default(),
+        )
+    });
+    (!server.is_empty() && !reference.is_empty()).then_some(ServerInfoBase { server, reference })
+}
+
+/// Reads a single value written in the same compact form as a 1C launch
+/// command, such as `/F /var/lib/ib` or `/Sserver\\base`.
+fn command_line_switch_value(value: &str, switch: &str) -> Option<String> {
+    let value = value.trim();
+    let prefix = value.get(..switch.len())?;
+    if !prefix.eq_ignore_ascii_case(switch) {
+        return None;
+    }
+    let remainder = value[switch.len()..].trim();
+    (!remainder.is_empty()).then(|| remainder.trim_matches('"').to_owned())
 }
 
 fn extract_connection_property(connection: &str, property: &str) -> Option<String> {
@@ -732,7 +1172,20 @@ impl Adapter {
             None => None,
         };
         let info_base = info_base_target(&arguments)?;
-        let trace_info_base = info_base.alias.clone();
+        if !launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+            anyhow::bail!("launchMode standaloneServer requires request launch");
+        }
+        // `ibsrv` registers the autonomous infobase in dbgs under its
+        // published name, not under the original file-base `DefAlias`.
+        // The thin client uses that same name in `/S…\\<name>`.
+        let debug_info_base_alias =
+            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+                standalone_server_name(&arguments)
+            } else {
+                info_base.alias.clone()
+            };
+        let trace_info_base = debug_info_base_alias.clone();
+        let launch_mode = arguments.launch_mode;
         let mut spawned_debug_server = if launch && info_base.is_file {
             let platform_path = arguments
                 .platform_path
@@ -756,11 +1209,33 @@ impl Adapter {
                 &arguments.debug_server_host,
                 arguments.debug_server_port,
             )?);
-        let session = match server.attach_debug_ui(&info_base.alias) {
+        let mut standalone_server =
+            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+                match launch_standalone_server(&arguments, &info_base, &server) {
+                    Ok(server) => Some(server),
+                    Err(error) => {
+                        if let Some(spawned) = &mut spawned_debug_server {
+                            terminate_child(&mut spawned.child);
+                        }
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+        let attach_result = if standalone_server.is_some() {
+            attach_debug_ui_after_startup(&server, &debug_info_base_alias)
+        } else {
+            server.attach_debug_ui(&debug_info_base_alias)
+        };
+        let session = match attach_result {
             Ok(session) => session,
             Err(error) => {
                 if let Some(spawned) = &mut spawned_debug_server {
                     terminate_child(&mut spawned.child);
+                }
+                if let Some(standalone) = &mut standalone_server {
+                    terminate_child(standalone);
                 }
                 return Err(error);
             }
@@ -771,6 +1246,9 @@ impl Adapter {
             if let Some(spawned) = &mut spawned_debug_server {
                 terminate_child(&mut spawned.child);
             }
+            if let Some(standalone) = &mut standalone_server {
+                terminate_child(standalone);
+            }
             return Err(error);
         }
         eprintln!(
@@ -780,7 +1258,9 @@ impl Adapter {
         );
         self.debug_server = Some(server);
         self.debug_session = Some(session);
+        self.auto_attach_types = auto_attach_types.iter().cloned().collect();
         self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
+        self.standalone_server = standalone_server;
         self.pending_debuggee = launch.then_some(PendingDebuggee {
             arguments,
             info_base,
@@ -800,6 +1280,7 @@ impl Adapter {
             "session.started",
             json!({
                 "request": if launch { "launch" } else { "attach" },
+                "launchMode": format!("{:?}", launch_mode),
                 "infoBase": trace_info_base,
                 "rdbgEndpoint": self.debug_server.as_ref().map(DebugServer::endpoint),
             }),
@@ -842,6 +1323,9 @@ impl Adapter {
         if let Some(mut debug_server) = self.file_debug_server.take() {
             terminate_child(&mut debug_server);
         }
+        if let Some(mut standalone_server) = self.standalone_server.take() {
+            terminate_child(&mut standalone_server);
+        }
         if let Some(mut debuggee) = self.debuggee.take() {
             terminate_child(&mut debuggee);
         }
@@ -850,6 +1334,7 @@ impl Adapter {
         self.call_stacks.clear();
         self.variable_references.clear();
         self.pending_evaluations.clear();
+        self.auto_attach_types.clear();
         self.module_registry = None;
         self.module_breakpoints.clear();
         self.pending_steps.clear();
@@ -1004,6 +1489,16 @@ impl Adapter {
                 )];
             }
         };
+        self.trace(
+            "dap.breakpoints.received",
+            json!({
+                "sourcePath": source_path,
+                "lineCount": breakpoints.len(),
+                "extensionName": module.extension_name.clone(),
+                "objectId": module.object_id.clone(),
+                "propertyId": module.property_id.clone(),
+            }),
+        );
         let key = (
             module.extension_name.clone(),
             module.object_id.clone(),
@@ -1037,12 +1532,20 @@ impl Adapter {
             )];
         };
         if let Err(error) = server.set_breakpoints(session, &modules) {
+            self.trace(
+                "rdbg.breakpoints.failed",
+                json!({ "sourcePath": source_path, "error": error.to_string() }),
+            );
             return vec![error_response(
                 request,
                 self.next_sequence(),
                 error.to_string(),
             )];
         }
+        self.trace(
+            "rdbg.breakpoints.applied",
+            json!({ "sourcePath": source_path, "lineCount": breakpoints.len() }),
+        );
         vec![response(
             request,
             self.next_sequence(),
@@ -1409,10 +1912,12 @@ impl Adapter {
                 else {
                     return Vec::new();
                 };
-                events
+                let mut messages = events
                     .into_iter()
                     .flat_map(|debug_event| self.handle_debug_event(&server, &session, debug_event))
-                    .collect()
+                    .collect::<Vec<_>>();
+                messages.extend(self.reconcile_auto_attach_targets(&server, &session));
+                messages
             }
             Err(error) if !self.poll_failed => {
                 self.poll_failed = true;
@@ -1429,12 +1934,71 @@ impl Adapter {
         }
     }
 
+    /// Some platform/standalone-server combinations create a target before
+    /// the Debug UI begins listening and never replay `targetStarted`.  A
+    /// sequential reconciliation after each completed ping covers that loss
+    /// without issuing a second long-poll or attaching a disallowed target.
+    fn reconcile_auto_attach_targets(
+        &mut self,
+        server: &DebugServer,
+        session: &DebugUiSession,
+    ) -> Vec<Value> {
+        if self.auto_attach_types.is_empty() {
+            return Vec::new();
+        }
+        let targets = match server.get_debug_targets(session) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.trace(
+                    "rdbg.target.reconcile_failed",
+                    json!({ "error": error.to_string() }),
+                );
+                return vec![self.output_event(
+                    "stderr",
+                    format!("cannot refresh 1C debug targets: {error}\n"),
+                )];
+            }
+        };
+        self.trace(
+            "rdbg.target.reconciled",
+            json!({ "available": targets.len(), "attached": self.threads.len() }),
+        );
+        let candidates = targets
+            .into_iter()
+            .filter(|target| {
+                !self.threads.contains_key(&target.id)
+                    && self.auto_attach_types.contains(&target.target_type)
+            })
+            .collect::<Vec<_>>();
+        candidates
+            .into_iter()
+            .flat_map(|target| {
+                self.handle_debug_event(
+                    server,
+                    session,
+                    DebugUiEvent {
+                        command_id: "targetStarted".to_owned(),
+                        target_id: Some(target.id),
+                        ..DebugUiEvent::default()
+                    },
+                )
+            })
+            .collect()
+    }
+
     fn handle_debug_event(
         &mut self,
         server: &DebugServer,
         session: &DebugUiSession,
         debug_event: DebugUiEvent,
     ) -> Vec<Value> {
+        self.trace(
+            "rdbg.event.received",
+            json!({
+                "command": debug_event.command_id.clone(),
+                "targetId": debug_event.target_id.clone(),
+            }),
+        );
         match (
             debug_event.command_id.as_str(),
             debug_event.target_id.clone(),
@@ -1444,6 +2008,10 @@ impl Adapter {
                     return Vec::new();
                 }
                 if let Err(error) = server.clear_break_on_next_statement(session) {
+                    self.trace(
+                        "rdbg.target.attach_failed",
+                        json!({ "targetId": target_id, "stage": "clearBreakOnNextStatement", "error": error.to_string() }),
+                    );
                     return vec![self.output_event(
                         "stderr",
                         format!("cannot clear 1C break-on-next-statement: {error}\n"),
@@ -1452,12 +2020,20 @@ impl Adapter {
                 if let Err(error) =
                     server.attach_debug_targets(session, std::slice::from_ref(&target_id))
                 {
+                    self.trace(
+                        "rdbg.target.attach_failed",
+                        json!({ "targetId": target_id, "stage": "attachDebugTarget", "error": error.to_string() }),
+                    );
                     return vec![
                         self.output_event("stderr", format!("cannot attach 1C target: {error}\n")),
                     ];
                 }
                 let thread_id = self.threads.values().max().copied().unwrap_or(0) + 1;
-                self.threads.insert(target_id, thread_id);
+                self.threads.insert(target_id.clone(), thread_id);
+                self.trace(
+                    "rdbg.target.attached",
+                    json!({ "targetId": target_id, "threadId": thread_id }),
+                );
                 vec![
                     event(
                         self.next_sequence(),
@@ -2222,9 +2798,21 @@ mod tests {
                     debug_server_port: 1550,
                     info_base: Some("Demo".to_owned()),
                     info_base_alias: None,
+                    user_name: None,
+                    password: None,
                     root_project: None,
                     platform_path: None,
                     platform_version: None,
+                    launch_mode: LaunchMode::StandaloneServer,
+                    standalone_server_host: None,
+                    standalone_server_port: None,
+                    standalone_server_base: None,
+                    standalone_server_data_path: None,
+                    standalone_server_transport: StandaloneServerTransport::Direct,
+                    standalone_server_name: None,
+                    standalone_server_direct_reg_port: None,
+                    standalone_server_direct_range: None,
+                    standalone_server_ssh_port: None,
                     extensions: None,
                     auto_attach_types: None,
                     trace: false,
@@ -2234,6 +2822,8 @@ mod tests {
                     alias: "Demo".to_owned(),
                     is_file: false,
                     direct_file_path: None,
+                    registered_file_path: None,
+                    direct_server: None,
                 },
             }),
             ..Default::default()
@@ -2517,6 +3107,8 @@ Connect=File="/tmp/demo";
                 alias: "DefAlias".to_owned(),
                 is_file: true,
                 direct_file_path: None,
+                registered_file_path: Some(PathBuf::from("/tmp/demo")),
+                direct_server: None,
             })
         );
         assert_eq!(
@@ -2525,9 +3117,239 @@ Connect=File="/tmp/demo";
                 alias: "Accounting".to_owned(),
                 is_file: false,
                 direct_file_path: None,
+                registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "localhost".to_owned(),
+                    reference: "Accounting".to_owned(),
+                }),
             })
         );
         assert_eq!(launcher_info_base(ibases, "Missing"), None);
+    }
+
+    #[test]
+    fn parses_the_standalone_server_launch_configuration() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "/tmp/demo",
+            "userName": "developer",
+            "password": "not-written-anywhere",
+            "platformPath": "/opt/1cv8/8.3.27",
+            "launchMode": "standaloneServer",
+            "standaloneServerHost": "127.0.0.1",
+            "standaloneServerPort": 8315,
+            "standaloneServerBase": "/demo",
+            "standaloneServerDataPath": "/tmp/standalone-state",
+            "standaloneServerTransport": "direct",
+            "standaloneServerName": "onec-test",
+            "standaloneServerDirectRegPort": 1941,
+            "standaloneServerDirectRange": "1960:1991",
+            "standaloneServerSshPort": 1943
+        }))
+        .unwrap();
+        assert_eq!(arguments.launch_mode, LaunchMode::StandaloneServer);
+        assert_eq!(arguments.user_name.as_deref(), Some("developer"));
+        assert_eq!(arguments.password.as_deref(), Some("not-written-anywhere"));
+        assert_eq!(
+            arguments.standalone_server_host.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(arguments.standalone_server_port, Some(8315));
+        assert_eq!(arguments.standalone_server_base.as_deref(), Some("/demo"));
+        assert_eq!(
+            arguments.standalone_server_transport,
+            StandaloneServerTransport::Direct
+        );
+        assert_eq!(
+            arguments.standalone_server_name.as_deref(),
+            Some("onec-test")
+        );
+        assert_eq!(
+            arguments.standalone_server_data_path.as_deref(),
+            Some("/tmp/standalone-state")
+        );
+        assert_eq!(arguments.standalone_server_direct_reg_port, Some(1941));
+        assert_eq!(
+            arguments.standalone_server_direct_range.as_deref(),
+            Some("1960:1991")
+        );
+        assert_eq!(arguments.standalone_server_ssh_port, Some(1943));
+
+        let default_arguments: ConnectionArguments = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(default_arguments.launch_mode, LaunchMode::Client);
+    }
+
+    #[test]
+    fn uses_the_published_standalone_name_as_the_debugger_alias() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "/F /tmp/demo",
+            "launchMode": "standaloneServer",
+            "standaloneServerName": "onec-debug-demo",
+        }))
+        .unwrap();
+
+        assert_eq!(standalone_server_name(&arguments), "onec-debug-demo");
+        assert_eq!(
+            standalone_server_direct_connection(&arguments),
+            "/S127.0.0.1:1941\\onec-debug-demo"
+        );
+    }
+
+    #[test]
+    fn builds_a_thin_client_url_for_the_standalone_server() {
+        let root: ConnectionArguments = serde_json::from_value(json!({
+            "standaloneServerHost": "127.0.0.1",
+            "standaloneServerPort": 8315,
+            "standaloneServerBase": "/"
+        }))
+        .unwrap();
+        assert_eq!(standalone_server_url(&root), "http://127.0.0.1:8315");
+        assert_eq!(
+            standalone_server_direct_connection(&root),
+            "/S127.0.0.1:1941\\onec-debug-1941"
+        );
+
+        let published: ConnectionArguments = serde_json::from_value(json!({
+            "standaloneServerHost": "localhost",
+            "standaloneServerPort": 8320,
+            "standaloneServerBase": "demo"
+        }))
+        .unwrap();
+        assert_eq!(
+            standalone_server_url(&published),
+            "http://localhost:8320/demo"
+        );
+    }
+
+    #[test]
+    fn rejects_password_without_a_user_name_before_launching_the_client() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "password": "secret"
+        }))
+        .unwrap();
+        let mut command = Command::new("true");
+        assert!(
+            append_client_credentials(&mut command, &arguments)
+                .unwrap_err()
+                .to_string()
+                .contains("password requires userName")
+        );
+    }
+
+    #[test]
+    fn discovers_current_launcher_locations_and_retains_legacy_locations() {
+        let home = Path::new("/home/tester");
+        assert_eq!(
+            launcher_startup_directories("macos", Some(home), None, None),
+            vec![
+                home.join(".1C/1cestart"),
+                home.join("Library/Application Support/1C/1CEStart"),
+                home.join(".1cv8/1C/1CEStart"),
+            ]
+        );
+        assert_eq!(
+            launcher_startup_directories("unix", Some(home), None, None),
+            vec![home.join(".1C/1cestart"), home.join(".1cv8/1C/1CEStart")]
+        );
+        assert_eq!(
+            launcher_startup_directories(
+                "windows",
+                None,
+                Some(Path::new("C:/Users/tester/AppData/Roaming")),
+                Some(Path::new("C:/Users/tester/AppData/Local")),
+            ),
+            vec![
+                PathBuf::from("C:/Users/tester/AppData/Roaming/1C/1CEStart"),
+                PathBuf::from("C:/Users/tester/AppData/Local/1C/1CEStart"),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolves_registered_infobases_from_common_launcher_lists_without_credentials() {
+        let root = std::env::temp_dir().join(format!("onec-ibases-{}", uuid::Uuid::new_v4()));
+        let launcher_directory = root.join(".1C/1cestart");
+        let relative_list = launcher_directory.join("shared/ibases.v8i");
+        let absolute_list = root.join("global.v8i");
+        fs::create_dir_all(relative_list.parent().unwrap()).unwrap();
+        fs::write(
+            launcher_directory.join("1cestart.cfg"),
+            format!(
+                "[Startup]\nCommonInfoBases=shared/ibases.v8i;\"{}\"\n",
+                absolute_list.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &relative_list,
+            "[Сервис локально]\nConnect=Srvr=\"localhost\";Ref=\"Service\";Usr=\"developer\";Pwd=\"secret\";\n",
+        )
+        .unwrap();
+        let mut utf16le = vec![0xff, 0xfe];
+        utf16le.extend(
+            "[Файловая]\nConnect=File=\"/tmp/demo\";\n"
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes),
+        );
+        fs::write(&absolute_list, utf16le).unwrap();
+
+        let paths = ibases_paths_from_startup_directories(vec![launcher_directory.clone()]);
+        assert_eq!(
+            paths,
+            vec![
+                launcher_directory.join("ibases.v8i"),
+                relative_list.clone(),
+                absolute_list.clone(),
+            ]
+        );
+        assert_eq!(
+            launcher_info_base_from_paths(&paths, "Сервис локально"),
+            Some(InfoBaseTarget {
+                alias: "Service".to_owned(),
+                is_file: false,
+                direct_file_path: None,
+                registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "localhost".to_owned(),
+                    reference: "Service".to_owned(),
+                }),
+            })
+        );
+        assert_eq!(
+            launcher_info_base_from_paths(&paths, "Файловая"),
+            Some(InfoBaseTarget {
+                alias: FILE_INFOBASE_ALIAS.to_owned(),
+                is_file: true,
+                direct_file_path: None,
+                registered_file_path: Some(PathBuf::from("/tmp/demo")),
+                direct_server: None,
+            })
+        );
+        assert!(
+            !format!(
+                "{:?}",
+                launcher_info_base_from_paths(&paths, "Сервис локально")
+            )
+            .contains("secret")
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn parses_common_info_base_paths_and_launcher_file_encodings() {
+        assert_eq!(
+            common_info_base_list_paths(
+                "CommonInfoBases = first.v8i; \"second.v8i\"\ncommoninfobases=third.v8i\n"
+            ),
+            vec![
+                "first.v8i".to_owned(),
+                "second.v8i".to_owned(),
+                "third.v8i".to_owned(),
+            ]
+        );
+        let mut utf16be = vec![0xfe, 0xff];
+        utf16be.extend("[База]".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(decode_platform_text(&utf16be).unwrap(), "[База]");
+        assert!(decode_platform_text(&[0xff, 0xfe, 1]).is_err());
     }
 
     #[test]
@@ -2535,8 +3357,9 @@ Connect=File="/tmp/demo";
         let directory =
             std::env::temp_dir().join(format!("onec-file-base-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(&directory).unwrap();
-        let direct = directory.to_string_lossy().into_owned();
-        let connection = format!("File=\"{direct}\";");
+        let file_path = directory.to_string_lossy().into_owned();
+        let direct = format!("/F {file_path}");
+        let connection = format!("File=\"{file_path}\";");
 
         assert_eq!(direct_file_infobase_path(&direct), Some(directory.clone()));
         assert_eq!(
@@ -2549,9 +3372,21 @@ Connect=File="/tmp/demo";
             debug_server_port: 1550,
             info_base: Some(direct),
             info_base_alias: Some("IgnoredForFileBase".to_owned()),
+            user_name: None,
+            password: None,
             root_project: None,
             platform_path: None,
             platform_version: None,
+            launch_mode: LaunchMode::Client,
+            standalone_server_host: None,
+            standalone_server_port: None,
+            standalone_server_base: None,
+            standalone_server_data_path: None,
+            standalone_server_transport: StandaloneServerTransport::Direct,
+            standalone_server_name: None,
+            standalone_server_direct_reg_port: None,
+            standalone_server_direct_range: None,
+            standalone_server_ssh_port: None,
             extensions: None,
             auto_attach_types: None,
             trace: false,
@@ -2563,10 +3398,40 @@ Connect=File="/tmp/demo";
                 alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
                 direct_file_path: Some(directory.clone()),
+                registered_file_path: None,
+                direct_server: None,
             }
         );
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn recognizes_direct_server_infobases_without_a_launcher_registration() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "/Ssrv-1c\\Accounting"
+        }))
+        .unwrap();
+        assert_eq!(
+            info_base_target(&arguments).unwrap(),
+            InfoBaseTarget {
+                alias: "Accounting".to_owned(),
+                is_file: false,
+                direct_file_path: None,
+                registered_file_path: None,
+                direct_server: Some(ServerInfoBase {
+                    server: "srv-1c".to_owned(),
+                    reference: "Accounting".to_owned(),
+                }),
+            }
+        );
+        assert_eq!(
+            direct_server_connection(&ServerInfoBase {
+                server: "srv-1c".to_owned(),
+                reference: "Accounting".to_owned(),
+            }),
+            "/Ssrv-1c\\Accounting"
+        );
     }
 
     #[test]
@@ -2578,9 +3443,21 @@ Connect=File="/tmp/demo";
             debug_server_port: 1550,
             info_base: Some("Demo".to_owned()),
             info_base_alias: None,
+            user_name: None,
+            password: None,
             root_project: None,
             platform_path: None,
             platform_version: None,
+            launch_mode: LaunchMode::Client,
+            standalone_server_host: None,
+            standalone_server_port: None,
+            standalone_server_base: None,
+            standalone_server_data_path: None,
+            standalone_server_transport: StandaloneServerTransport::Direct,
+            standalone_server_name: None,
+            standalone_server_direct_reg_port: None,
+            standalone_server_direct_range: None,
+            standalone_server_ssh_port: None,
             extensions: None,
             auto_attach_types: None,
             trace: false,

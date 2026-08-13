@@ -1,19 +1,28 @@
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 const vscode = require("vscode");
 const {
   canonicalDirectory,
   configurationSummary,
   defaultPlatformRoots,
+  fileInfoBaseArgument,
+  discoverIbaseEntries,
+  discoverV8ProjectEntries,
   discoverPlatformDirectories,
   hasCredentials,
+  ibasesFilePickerChoice,
   isSamePath,
+  mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseServerInfoBaseArgument,
+  serverInfoBaseArgument,
   uniqueConfigurationName,
   isPlatformVersionDirectory,
   validatePlatformDirectory
 } = require("./setup-wizard");
+const { discoverInfoBaseExtensions } = require("./extension-inventory");
 
 const IGNORED_DISCOVERY_DIRECTORIES = new Set([
   ".git",
@@ -142,6 +151,19 @@ async function pickDirectory(title, defaultUri, canSelectMany = false) {
   return selected?.map((item) => item.fsPath);
 }
 
+async function pickIbasesFile(defaultUri) {
+  const selected = await vscode.window.showOpenDialog({
+    title: "1C: Выберите файл ibases.v8i",
+    defaultUri,
+    canSelectFiles: true,
+    canSelectFolders: false,
+    canSelectMany: false,
+    openLabel: "Выбрать ibases.v8i",
+    filters: { "Списки баз 1С": ["v8i"] }
+  });
+  return selected?.[0]?.fsPath;
+}
+
 async function chooseBaseProject(workspaceFolder) {
   const discovered = await vscode.window.withProgress(
     {
@@ -213,7 +235,7 @@ function duplicateExtensionName(extensions) {
   return undefined;
 }
 
-async function chooseExtensions(workspaceFolder, baseProject) {
+async function chooseExtensionsManually(workspaceFolder, baseProject) {
   const discovered = await discoveredExtensionCandidates(workspaceFolder, baseProject);
   let selectedPaths = [];
   while (true) {
@@ -303,7 +325,89 @@ async function chooseExtensions(workspaceFolder, baseProject) {
   }
 }
 
-async function chooseRequest() {
+function sameExtensionName(first, second) {
+  return typeof first === "string" && typeof second === "string"
+    && first.localeCompare(second, undefined, { sensitivity: "accent" }) === 0;
+}
+
+async function chooseExtensionSource(workspaceFolder, extensionName, candidates) {
+  const matching = candidates.filter((item) => sameExtensionName(item.name, extensionName));
+  while (true) {
+    const picked = await vscode.window.showQuickPick(
+      [
+        ...matching.map((extension, index) => ({
+          label: `$(folder) ${formatPathForWorkspace(extension.path, workspaceFolder)}`,
+          description: index === 0 ? "Найдено совпадение по имени расширения" : "Ещё один каталог с таким именем",
+          detail: extension.path,
+          extension
+        })),
+        ...candidates
+          .filter((extension) => !sameExtensionName(extension.name, extensionName))
+          .map((extension) => ({
+            label: `$(folder) ${formatPathForWorkspace(extension.path, workspaceFolder)}`,
+            description: `Исходники «${extension.name}» — имя не совпадает`,
+            detail: extension.path,
+            extension
+          })),
+        {
+          label: "$(folder-opened) Выбрать каталог…",
+          description: "Каталог должен содержать Configuration.xml",
+          browse: true
+        },
+        {
+          label: "Пропустить это расширение",
+          description: "Точки останова в его исходниках не будут сопоставляться",
+          skip: true
+        }
+      ],
+      {
+        title: `1C: Исходники расширения «${extensionName}»`,
+        placeHolder: "Выберите соответствующий каталог исходников"
+      }
+    );
+    // Esc cancels the complete wizard.  That is distinct from the explicit
+    // per-extension skip, which keeps configuring the remaining extensions.
+    if (!picked) return { cancelled: true };
+    if (picked.skip) return { skipped: true };
+    let selected = picked.extension;
+    if (picked.browse) {
+      const directory = (await pickDirectory(
+        `1C: Исходники расширения «${extensionName}»`,
+        workspaceFolder.uri
+      ))?.[0];
+      if (!directory) continue;
+      try {
+        selected = await extensionRoot(directory);
+      } catch (error) {
+        await vscode.window.showErrorMessage(`Не удалось добавить расширение: ${error.message}`);
+        continue;
+      }
+    }
+    if (!sameExtensionName(selected.name, extensionName)) {
+      await vscode.window.showErrorMessage(
+        `Выбран каталог расширения «${selected.name}», а в базе включено «${extensionName}». Выберите соответствующие исходники.`
+      );
+      continue;
+    }
+    return { extension: selected };
+  }
+}
+
+async function chooseExtensionsFromInfoBase(workspaceFolder, baseProject, extensionNames) {
+  const candidates = await discoveredExtensionCandidates(workspaceFolder, baseProject);
+  const selected = [];
+  for (const extensionName of extensionNames) {
+    const result = await chooseExtensionSource(workspaceFolder, extensionName, candidates);
+    if (result.cancelled) return undefined;
+    const extension = result.extension;
+    if (extension && !selected.some((item) => isSamePath(item.path, extension.path))) {
+      selected.push(extension);
+    }
+  }
+  return selected;
+}
+
+async function chooseRequest(selectedInfoBase) {
   const selected = await vscode.window.showQuickPick(
     [
       {
@@ -317,9 +421,75 @@ async function chooseRequest() {
         request: "attach"
       }
     ],
-    { title: "1C: Режим отладки" }
+    {
+      title: "1C: Режим отладки"
+    }
   );
   return selected?.request;
+}
+
+async function chooseLaunchMode(selectedInfoBase, request) {
+  if (request !== "launch") return "client";
+  if (!selectedInfoBase.supportsStandaloneServer) return "client";
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Обычный клиент 1С (рекомендуется)",
+        description: "Запустить 1cv8c; для файловой базы адаптер сам поднимет временный dbgs",
+        mode: "client"
+      },
+      {
+        label: "Автономный сервер 1С (ibsrv)",
+        description: "Запустить локальный ibsrv; отладчик создаст временный dbgs",
+        detail: "После старта сервера откроется тонкий клиент; сервер остановится вместе с отладочной сессией.",
+        mode: "standaloneServer"
+      }
+    ],
+    {
+      title: "1C: Способ запуска файловой базы",
+      placeHolder: "Выберите, кто будет запускать базу"
+    }
+  );
+  return selected?.mode;
+}
+
+async function chooseStandaloneTransport(launchMode) {
+  if (launchMode !== "standaloneServer") return undefined;
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Прямое соединение тонкого клиента (рекомендуется)",
+        description: "TCP/IP через шлюз ibsrv; не использует HTTP-страницу входа",
+        detail: "Тонкий клиент подключится к локальному автономному серверу напрямую.",
+        transport: "direct"
+      },
+      {
+        label: "HTTP-соединение тонкого клиента",
+        description: "Тонкий клиент через /WS и встроенный HTTP-шлюз ibsrv",
+        detail: "Нужно, только если требуется проверить именно HTTP-публикацию.",
+        transport: "http"
+      }
+    ],
+    {
+      title: "1C: Подключение тонкого клиента к автономному серверу",
+      placeHolder: "Выберите транспорт клиента"
+    }
+  );
+  return selected?.transport;
+}
+
+async function firstAvailableLocalPort(first = 8314, last = 8399) {
+  for (let port = first; port <= last; port += 1) {
+    const available = await new Promise((resolve) => {
+      const server = net.createServer();
+      server.once("error", () => resolve(false));
+      server.listen({ host: "127.0.0.1", port }, () => {
+        server.close(() => resolve(true));
+      });
+    });
+    if (available) return port;
+  }
+  return undefined;
 }
 
 async function inputInfoBase(title, prompt) {
@@ -339,36 +509,126 @@ async function inputInfoBase(title, prompt) {
   }
 }
 
-async function chooseLaunchInfoBase(workspaceFolder) {
-  const selected = await vscode.window.showQuickPick(
-    [
-      {
-        label: "Файловая информационная база",
-        description: "Выбрать существующий каталог файловой базы",
-        kind: "file"
-      },
-      {
-        label: "Зарегистрированная информационная база",
-        description: "Ввести имя базы из списка запуска 1С",
-        kind: "registered"
-      }
-    ],
-    { title: "1C: Информационная база для запуска" }
+function ibaseChoiceDescription(entry) {
+  if (entry.kind === "file") return `Файловая: ${entry.filePath}`;
+  if (entry.kind === "server") return `Серверная: ${entry.server}/${entry.reference}`;
+  return "Зарегистрированная информационная база";
+}
+
+async function chooseInfoBase(workspaceFolder) {
+  const [launcherEntries, projectEntries] = await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Window, title: "1C: Поиск зарегистрированных информационных баз" },
+    () => Promise.all([
+      discoverIbaseEntries(),
+      discoverV8ProjectEntries(workspaceFolder.uri.fsPath)
+    ])
   );
-  if (!selected) return undefined;
-  if (selected.kind === "registered") {
-    return inputInfoBase(
-      "1C: Имя зарегистрированной базы",
-      "Введите только имя базы, без строки подключения и пароля"
+  let entries = mergeInfoBaseEntries(projectEntries, launcherEntries);
+  while (true) {
+    const selected = await vscode.window.showQuickPick(
+      [
+        ...entries.map((entry) => ({
+          label: entry.name,
+          description: ibaseChoiceDescription(entry),
+          detail: entry.hasStoredCredentials
+            ? "Сохранённые учётные данные останутся только в списке запуска 1С"
+            : entry.source === "v8-project"
+              ? `из .v8-project.json${entry.isDefault ? " — база по умолчанию" : ""}`
+              : undefined,
+          picked: entry.isDefault === true,
+          entry
+        })),
+        ibasesFilePickerChoice(),
+        {
+          label: "$(folder-opened) Выбрать каталог файловой базы…",
+          description: "База, которой нет в списке запуска 1С",
+          browse: true
+        },
+        {
+          label: "$(edit) Ввести серверное подключение…",
+          description: "Формат: /Sserver\\base без учётных данных",
+          manual: true
+        }
+      ],
+      {
+        title: "1C: Информационная база для отладки",
+        placeHolder: "Выберите базу из списка запуска 1С"
+      }
     );
-  }
-  const directory = (await pickDirectory("1C: Каталог файловой информационной базы", workspaceFolder.uri))?.[0];
-  if (!directory) return undefined;
-  try {
-    return await canonicalDirectory(directory);
-  } catch (error) {
-    await vscode.window.showErrorMessage(`Не удалось выбрать файловую базу: ${error.message}`);
-    return chooseLaunchInfoBase(workspaceFolder);
+    if (!selected) return undefined;
+    if (selected.ibasesFile) {
+      const ibasesFile = await pickIbasesFile(workspaceFolder.uri);
+      if (!ibasesFile) continue;
+      const imported = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Window,
+          title: "1C: Чтение списка информационных баз"
+        },
+        () => discoverIbaseEntries({ files: [ibasesFile] })
+      );
+      if (!imported.length) {
+        await vscode.window.showWarningMessage(
+          "В выбранном файле ibases.v8i не найдено доступных подключений к информационным базам."
+        );
+        continue;
+      }
+      entries = mergeInfoBaseEntries(entries, imported);
+      continue;
+    }
+    if (selected.entry) {
+      if (selected.entry.kind === "file" && selected.entry.filePath) {
+        return {
+          infoBase: fileInfoBaseArgument(selected.entry.filePath),
+          inventoryConnection: { kind: "file", value: selected.entry.filePath },
+          supportsStandaloneServer: true
+        };
+      }
+      if (selected.entry.kind === "server" && selected.entry.server && selected.entry.reference) {
+        const connection = `${selected.entry.server}\\${selected.entry.reference}`;
+        return {
+          infoBase: serverInfoBaseArgument(selected.entry.server, selected.entry.reference),
+          infoBaseAlias: selected.entry.reference,
+          inventoryConnection: { kind: "server", value: connection },
+          supportsStandaloneServer: false
+        };
+      }
+      await vscode.window.showErrorMessage(
+        "У выбранной записи нет файлового пути или пары Srvr/Ref; её нельзя записать в launch.json без имени регистрации."
+      );
+      continue;
+    }
+    if (selected.manual) {
+      const infoBase = await inputInfoBase(
+        "1C: Серверное подключение",
+        "Введите /Sserver\\base без логина и пароля"
+      );
+      if (!infoBase) return undefined;
+      const server = parseServerInfoBaseArgument(infoBase);
+      if (!server) {
+        await vscode.window.showErrorMessage(
+          "Нужно указать сервер и базу в формате /Sserver\\base."
+        );
+        continue;
+      }
+      return {
+        infoBase: serverInfoBaseArgument(server.server, server.reference),
+        infoBaseAlias: server.reference,
+        inventoryConnection: { kind: "server", value: `${server.server}\\${server.reference}` },
+        supportsStandaloneServer: false
+      };
+    }
+    const directory = (await pickDirectory("1C: Каталог файловой информационной базы", workspaceFolder.uri))?.[0];
+    if (!directory) continue;
+    try {
+      const infoBase = await canonicalDirectory(directory);
+      return {
+        infoBase: fileInfoBaseArgument(infoBase),
+        inventoryConnection: { kind: "file", value: infoBase },
+        supportsStandaloneServer: true
+      };
+    } catch (error) {
+      await vscode.window.showErrorMessage(`Не удалось выбрать файловую базу: ${error.message}`);
+    }
   }
 }
 
@@ -376,8 +636,11 @@ async function choosePlatformDirectory(workspaceFolder) {
   const discovered = await discoverPlatformDirectories();
   const choices = [
     ...discovered.map((directory, index) => ({
-      label: `$(tools) ${directory}`,
-      description: index === 0 ? "Рекомендуется: содержит 1cv8c и dbgs" : "Содержит 1cv8c и dbgs",
+      label: `$(tools) ${platformVersionLabel(directory)}`,
+      description: index === 0
+        ? `Рекомендуется: ${directory}`
+        : directory,
+      detail: "Содержит 1cv8c и dbgs",
       directory
     })),
     {
@@ -408,6 +671,11 @@ async function choosePlatformDirectory(workspaceFolder) {
   }
 }
 
+function platformVersionLabel(directory) {
+  const last = path.basename(directory);
+  return last.toLocaleLowerCase() === "bin" ? path.basename(path.dirname(directory)) : last;
+}
+
 async function chooseDebugServer() {
   const host = await vscode.window.showInputBox({
     title: "1C: Сервер отладки",
@@ -432,6 +700,51 @@ async function chooseDebugServer() {
   return { host: host.trim(), port: Number(portValue) };
 }
 
+async function chooseLaunchCredentials(request) {
+  if (request !== "launch") return { userName: undefined };
+  const choice = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Без авторизации",
+        description: "Клиент покажет обычный вход, если база его требует"
+      },
+      {
+        label: "Указать пользователя и спрашивать пароль при запуске",
+        description: "Пароль не записывается в launch.json",
+        credentials: true
+      }
+    ],
+    {
+      title: "1C: Авторизация при запуске",
+      placeHolder: "Выберите способ входа в базу"
+    }
+  );
+  if (!choice) return undefined;
+  if (!choice.credentials) return { userName: undefined };
+  const userName = await vscode.window.showInputBox({
+    title: "1C: Пользователь базы",
+    prompt: "Имя пользователя будет передано тонкому клиенту как /N",
+    placeHolder: "Например, Администратор",
+    validateInput: (value) => value.trim() ? undefined : "Укажите имя пользователя."
+  });
+  return userName === undefined ? undefined : { userName: userName.trim() };
+}
+
+function passwordInputId(inputs) {
+  const used = new Set(
+    inputs
+      .filter((input) => input && typeof input.id === "string")
+      .map((input) => input.id)
+  );
+  let suffix = 1;
+  let id = "onec.debugger.password";
+  while (used.has(id)) {
+    suffix += 1;
+    id = `onec.debugger.password.${suffix}`;
+  }
+  return id;
+}
+
 async function chooseOptionalAlias() {
   const alias = await vscode.window.showInputBox({
     title: "1C: Псевдоним информационной базы",
@@ -454,44 +767,108 @@ async function launchConfigurationsFor(folder) {
 async function configureDebugger() {
   const workspaceFolder = await chooseWorkspaceFolder();
   if (!workspaceFolder) return;
+  // The platform comes first: it is needed by Designer to inspect the chosen
+  // base's enabled extensions, even when the final configuration is attach.
+  const selectedPlatformPath = await choosePlatformDirectory(workspaceFolder);
+  if (!selectedPlatformPath) return;
+  const selectedInfoBase = await chooseInfoBase(workspaceFolder);
+  if (!selectedInfoBase) return;
   const rootProject = await chooseBaseProject(workspaceFolder);
   if (!rootProject) return;
-  const extensions = await chooseExtensions(workspaceFolder, rootProject);
-  if (!extensions) return;
-  const request = await chooseRequest();
-  if (!request) return;
 
-  const infoBase = request === "launch"
-    ? await chooseLaunchInfoBase(workspaceFolder)
-    : await inputInfoBase(
-      "1C: Информационная база для подключения",
-      "Введите имя базы или её серверный идентификатор, без учётных данных"
+  let installedExtensionNames;
+  try {
+    installedExtensionNames = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: "1C: Чтение списка расширений информационной базы",
+        cancellable: false
+      },
+      () => discoverInfoBaseExtensions({
+        platformDirectory: selectedPlatformPath,
+        connection: selectedInfoBase.inventoryConnection
+      })
     );
-  if (!infoBase) return;
+  } catch (error) {
+    await vscode.window.showWarningMessage(
+      `Не удалось автоматически прочитать расширения базы. Можно выбрать исходники вручную. Причина: ${error.message}`
+    );
+  }
+  const extensions = Array.isArray(installedExtensionNames)
+    ? await chooseExtensionsFromInfoBase(workspaceFolder, rootProject, installedExtensionNames)
+    : await chooseExtensionsManually(workspaceFolder, rootProject);
+  if (!extensions) return;
+
+  const request = await chooseRequest(selectedInfoBase);
+  if (!request) return;
+  const credentials = await chooseLaunchCredentials(request);
+  if (!credentials) return;
+  const launchMode = await chooseLaunchMode(selectedInfoBase, request);
+  if (!launchMode) return;
+  const standaloneTransport = await chooseStandaloneTransport(launchMode);
+  if (launchMode === "standaloneServer" && !standaloneTransport) return;
+
   const debugServer = await chooseDebugServer();
   if (!debugServer) return;
   const aliasResult = request === "attach" ? await chooseOptionalAlias() : { value: undefined };
   if (!aliasResult) return;
-  const platformPath = request === "launch" ? await choosePlatformDirectory(workspaceFolder) : undefined;
-  if (request === "launch" && !platformPath) return;
 
   const existing = await launchConfigurationsFor(workspaceFolder);
+  const existingInputs = vscode.workspace
+    .getConfiguration("launch", workspaceFolder.uri)
+    .get("inputs", []);
+  const inputs = Array.isArray(existingInputs) ? existingInputs : [];
   const mode = request === "launch" ? "запуск" : "подключение";
   const configuration = {
     name: uniqueConfigurationName(existing, `1C: ${path.basename(rootProject)} (${mode})`),
     type: "onec",
     request,
+    launchMode,
     rootProject,
-    infoBase,
+    infoBase: selectedInfoBase.infoBase,
     debugServerHost: debugServer.host,
     debugServerPort: debugServer.port,
     autoAttachTypes: ["ManagedClient", "Server"]
   };
+  if (selectedInfoBase.infoBaseAlias) configuration.infoBaseAlias = selectedInfoBase.infoBaseAlias;
   if (aliasResult.value) configuration.infoBaseAlias = aliasResult.value;
   if (extensions.length) configuration.extensions = extensions.map((extension) => extension.path);
+  let passwordInput;
+  if (credentials.userName) {
+    const inputId = passwordInputId(inputs);
+    configuration.userName = credentials.userName;
+    configuration.password = `\${input:${inputId}}`;
+    passwordInput = {
+      id: inputId,
+      type: "promptString",
+      description: `Пароль пользователя «${credentials.userName}» для 1С`,
+      password: true
+    };
+  }
   if (request === "launch") {
-    configuration.platformPath = platformPath;
+    configuration.platformPath = selectedPlatformPath;
     configuration.platformVersion = "LATEST";
+    if (launchMode === "standaloneServer") {
+      const standaloneServerPort = await firstAvailableLocalPort();
+      if (!standaloneServerPort) {
+        await vscode.window.showErrorMessage("Не найден свободный порт для HTTP автономного сервера (8314–8399).");
+        return;
+      }
+      // `ibsrv` binds a single address. A numeric loopback avoids a macOS
+      // IPv6 `localhost` lookup that the thin client may not fall back from.
+      configuration.standaloneServerHost = "127.0.0.1";
+      configuration.standaloneServerPort = standaloneServerPort;
+      configuration.standaloneServerBase = "/";
+      configuration.standaloneServerTransport = standaloneTransport;
+      configuration.standaloneServerDirectRegPort = 1941;
+      configuration.standaloneServerDirectRange = "1960:1991";
+      configuration.standaloneServerName = `onec-debug-${configuration.standaloneServerDirectRegPort}`;
+      configuration.standaloneServerDataPath = path.join(
+        workspaceFolder.uri.fsPath,
+        ".vscode",
+        "onec-standalone-server"
+      );
+    }
   }
 
   const confirmation = await vscode.window.showInformationMessage(
@@ -507,9 +884,15 @@ async function configureDebugger() {
     configuration.name
   );
   try {
-    await vscode.workspace
-      .getConfiguration("launch", workspaceFolder.uri)
-      .update(
+    const launchSettings = vscode.workspace.getConfiguration("launch", workspaceFolder.uri);
+    if (passwordInput) {
+      await launchSettings.update(
+        "inputs",
+        [...inputs, passwordInput],
+        vscode.ConfigurationTarget.WorkspaceFolder
+      );
+    }
+    await launchSettings.update(
         "configurations",
         [...latest, configuration],
         vscode.ConfigurationTarget.WorkspaceFolder
