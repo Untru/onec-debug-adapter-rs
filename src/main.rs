@@ -302,7 +302,10 @@ fn launch_debuggee(
     let mut command = Command::new(&executable);
     command.arg("ENTERPRISE");
     if arguments.launch_mode == LaunchMode::StandaloneServer {
-        command.arg("/WS").arg(standalone_server_url(arguments));
+        // The platform syntax is one token: `/WS"http://host:port"`.
+        // Passing `/WS` and the URL separately starts a client, but it does
+        // not form the standalone-server HTTP session correctly.
+        command.arg(format!("/WS{}", standalone_server_url(arguments)));
     } else if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
     } else {
@@ -338,7 +341,7 @@ fn standalone_server_url(arguments: &ConnectionArguments) -> String {
         .standalone_server_host
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localhost");
+        .unwrap_or("127.0.0.1");
     let port = arguments.standalone_server_port.unwrap_or(8314);
     let base = arguments
         .standalone_server_base
@@ -387,7 +390,7 @@ fn launch_standalone_server(
         .standalone_server_host
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("localhost");
+        .unwrap_or("127.0.0.1");
     let http_port = arguments.standalone_server_port.unwrap_or(8314);
     let http_base = arguments
         .standalone_server_base

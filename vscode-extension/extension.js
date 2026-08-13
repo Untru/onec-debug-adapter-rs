@@ -763,7 +763,9 @@ async function configureDebugger() {
         await vscode.window.showErrorMessage("Не найден свободный порт для HTTP автономного сервера (8314–8399).");
         return;
       }
-      configuration.standaloneServerHost = "localhost";
+      // `ibsrv` binds a single address. A numeric loopback avoids a macOS
+      // IPv6 `localhost` lookup that the thin client may not fall back from.
+      configuration.standaloneServerHost = "127.0.0.1";
       configuration.standaloneServerPort = standaloneServerPort;
       configuration.standaloneServerBase = "/";
       configuration.standaloneServerDirectRegPort = 1941;

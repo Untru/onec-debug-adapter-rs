@@ -129,8 +129,8 @@
               },
               "standaloneServerHost": {
                 "type": "string",
-                "default": "localhost",
-                "description": "HTTP address for ibsrv when launchMode is standaloneServer"
+                "default": "127.0.0.1",
+                "description": "HTTP address for ibsrv when launchMode is standaloneServer; use 127.0.0.1 for a local thin client"
               },
               "standaloneServerPort": {
                 "type": "number",
