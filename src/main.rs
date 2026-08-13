@@ -5,9 +5,9 @@ mod metadata;
 use anyhow::{Context, Result};
 use dap::{Reader, Writer, error_response, event, response};
 use debug_server::{
-    CalculationPathItem, DebugEvaluation, DebugServer, DebugStackFrame, DebugTarget, DebugUiEvent,
-    DebugUiSession, DebugVariable, EvaluationInterface, ModuleBreakpoints, SourceBreakpoint,
-    StepAction,
+    CalculationPathItem, DebugEvaluation, DebugMeasuredLine, DebugMeasurement, DebugServer,
+    DebugStackFrame, DebugTarget, DebugUiEvent, DebugUiSession, DebugVariable, EvaluationInterface,
+    ModuleBreakpoints, SourceBreakpoint, StepAction,
 };
 use metadata::ModuleRegistry;
 use serde::Deserialize;
@@ -48,6 +48,20 @@ struct Adapter {
     trace: Option<LatencyTrace>,
     next_trace_id: u64,
     pending_steps: BTreeMap<String, u64>,
+    performance_session: Option<PerformanceSession>,
+    performance_results: Vec<PerformanceResult>,
+}
+
+struct PerformanceSession {
+    id: String,
+    thread_id: i64,
+    stopping: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PerformanceResult {
+    source_path: PathBuf,
+    line: DebugMeasuredLine,
 }
 
 type DebuggeeLauncher = fn(&ConnectionArguments, &InfoBaseTarget, &DebugServer) -> Result<Child>;
@@ -150,6 +164,8 @@ impl Default for Adapter {
             trace: None,
             next_trace_id: 0,
             pending_steps: BTreeMap::new(),
+            performance_session: None,
+            performance_results: Vec::new(),
         }
     }
 }
@@ -1130,6 +1146,9 @@ impl Adapter {
             "SetAutoAttachTargetTypesRequest" => self.set_auto_attach_target_types(request),
             "DebugTargetsRequest" => self.debug_targets(request),
             "AttachDebugTargetRequest" => self.attach_debug_target(request),
+            "StartPerformanceMeasurementRequest" => self.start_performance_measurement(request),
+            "StopPerformanceMeasurementRequest" => self.stop_performance_measurement(request),
+            "PerformanceMeasurementResultsRequest" => self.performance_measurement_results(request),
             "evaluate" => self.evaluate(request),
             "disconnect" | "terminate" => match self.disconnect() {
                 Ok(()) => vec![response(request, self.next_sequence(), json!({}))],
@@ -1338,6 +1357,8 @@ impl Adapter {
         self.module_registry = None;
         self.module_breakpoints.clear();
         self.pending_steps.clear();
+        self.performance_session = None;
+        self.performance_results.clear();
         self.trace("session.ended", json!({}));
         self.trace = None;
         detach_result
@@ -1688,6 +1709,124 @@ impl Adapter {
                 error.to_string(),
             )],
         }
+    }
+
+    fn start_performance_measurement(&mut self, request: &Value) -> Vec<Value> {
+        if self.performance_session.is_some() {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "a 1C performance measurement is already running",
+            )];
+        }
+        let thread_id = match request["arguments"]["threadId"].as_i64() {
+            Some(thread_id) => thread_id,
+            None => {
+                return vec![error_response(
+                    request,
+                    self.next_sequence(),
+                    "StartPerformanceMeasurementRequest requires arguments.threadId",
+                )];
+            }
+        };
+        if self.target_id(thread_id).is_none() {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                format!("unknown 1C debug thread {thread_id}"),
+            )];
+        }
+        let (Some(server), Some(session)) = (self.debug_server.clone(), self.debug_session.clone())
+        else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let session_id = uuid::Uuid::new_v4().to_string();
+        if let Err(error) = server.set_measure_mode(&session, &session_id) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )];
+        }
+        self.performance_results.clear();
+        self.performance_session = Some(PerformanceSession {
+            id: session_id.clone(),
+            thread_id,
+            stopping: false,
+        });
+        self.trace(
+            "performance.started",
+            json!({ "sessionId": session_id, "threadId": thread_id }),
+        );
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "sessionId": session_id }),
+        )]
+    }
+
+    fn stop_performance_measurement(&mut self, request: &Value) -> Vec<Value> {
+        let Some(performance) = self.performance_session.as_ref() else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C performance measurement is running",
+            )];
+        };
+        if performance.stopping {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "the 1C performance measurement is already stopping",
+            )];
+        }
+        let (Some(server), Some(session)) = (self.debug_server.clone(), self.debug_session.clone())
+        else {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                "no 1C debug session is attached",
+            )];
+        };
+        let disabled_session_id = uuid::Uuid::nil().to_string();
+        if let Err(error) = server.set_measure_mode(&session, &disabled_session_id) {
+            return vec![error_response(
+                request,
+                self.next_sequence(),
+                error.to_string(),
+            )];
+        }
+        let performance_id = performance.id.clone();
+        let performance_thread_id = performance.thread_id;
+        if let Some(performance) = &mut self.performance_session {
+            performance.stopping = true;
+        }
+        self.trace(
+            "performance.stop_requested",
+            json!({ "sessionId": performance_id, "threadId": performance_thread_id }),
+        );
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "sessionId": performance_id }),
+        )]
+    }
+
+    fn performance_measurement_results(&mut self, request: &Value) -> Vec<Value> {
+        let results = self
+            .performance_results
+            .iter()
+            .map(performance_result_value)
+            .collect::<Vec<_>>();
+        vec![response(
+            request,
+            self.next_sequence(),
+            json!({ "results": results }),
+        )]
     }
 
     fn attach_debug_target(&mut self, request: &Value) -> Vec<Value> {
@@ -2070,10 +2209,72 @@ impl Adapter {
                     Some("exception"),
                 ),
             ("exprEvaluated", _) => self.handle_evaluation_event(debug_event),
+            ("measureResultProcessing", _) => self.handle_measurement_event(debug_event),
             (command_id, _) => {
                 vec![self.output_event("console", format!("1C debug event: {command_id}\n"))]
             }
         }
+    }
+
+    fn handle_measurement_event(&mut self, debug_event: DebugUiEvent) -> Vec<Value> {
+        let Some(measurement) = debug_event.measurement else {
+            return vec![self.output_event(
+                "stderr",
+                "1C sent an empty performance measurement result\n".to_owned(),
+            )];
+        };
+        let received_session_id = measurement.session_id.clone();
+        let is_current_session = self
+            .performance_session
+            .as_ref()
+            .is_some_and(|session| session.id == received_session_id);
+        if !is_current_session {
+            self.trace(
+                "performance.ignored",
+                json!({ "sessionId": received_session_id }),
+            );
+            return vec![self.output_event(
+                "console",
+                "ignored a performance result from an inactive 1C measurement session\n".to_owned(),
+            )];
+        }
+        let count = self.store_measurement(measurement);
+        self.performance_session = None;
+        self.trace(
+            "performance.received",
+            json!({ "sessionId": received_session_id, "lineCount": count }),
+        );
+        vec![event(
+            self.next_sequence(),
+            "PerformanceMeasurementUpdated",
+            json!({ "lineCount": count }),
+        )]
+    }
+
+    fn store_measurement(&mut self, measurement: DebugMeasurement) -> usize {
+        let Some(registry) = &self.module_registry else {
+            return 0;
+        };
+        let mut results = Vec::new();
+        for module in measurement.modules {
+            let Some(path) = registry
+                .path_by_module(
+                    &module.extension_name,
+                    &module.object_id,
+                    &module.property_id,
+                )
+                .map(Path::to_path_buf)
+            else {
+                continue;
+            };
+            results.extend(module.lines.into_iter().map(|line| PerformanceResult {
+                source_path: path.clone(),
+                line,
+            }));
+        }
+        let count = results.len();
+        self.performance_results = results;
+        count
     }
 
     fn handle_call_stack_event(
@@ -2650,6 +2851,17 @@ fn debug_target_item(target: &DebugTarget) -> Value {
     })
 }
 
+fn performance_result_value(result: &PerformanceResult) -> Value {
+    json!({
+        "source": { "path": result.source_path.to_string_lossy() },
+        "line": result.line.line,
+        "frequency": result.line.frequency,
+        "duration": result.line.duration,
+        "pureDuration": result.line.pure_duration,
+        "serverCallSignal": result.line.server_call_signal,
+    })
+}
+
 fn debug_target_type_presentation(target_type: &str) -> &str {
     match target_type {
         "Unknown" => "Неизвестный тип",
@@ -2947,6 +3159,60 @@ mod tests {
         assert!(response[0]["success"].as_bool().unwrap());
         assert_eq!(response[0]["body"]["result"], "42");
         assert!(adapter.pending_evaluations.is_empty());
+    }
+
+    #[test]
+    fn exposes_only_the_current_performance_measurement_result() {
+        let mut adapter = Adapter {
+            performance_session: Some(PerformanceSession {
+                id: "current-session".to_owned(),
+                thread_id: 7,
+                stopping: true,
+            }),
+            ..Default::default()
+        };
+
+        let ignored = adapter.handle_measurement_event(DebugUiEvent {
+            command_id: "measureResultProcessing".to_owned(),
+            measurement: Some(DebugMeasurement {
+                session_id: "obsolete-session".to_owned(),
+                ..DebugMeasurement::default()
+            }),
+            ..DebugUiEvent::default()
+        });
+        assert_eq!(ignored[0]["event"], "output");
+        assert!(adapter.performance_session.is_some());
+        assert!(adapter.performance_results.is_empty());
+
+        let received = adapter.handle_measurement_event(DebugUiEvent {
+            command_id: "measureResultProcessing".to_owned(),
+            measurement: Some(DebugMeasurement {
+                session_id: "current-session".to_owned(),
+                ..DebugMeasurement::default()
+            }),
+            ..DebugUiEvent::default()
+        });
+        assert_eq!(received[0]["event"], "PerformanceMeasurementUpdated");
+        assert!(adapter.performance_session.is_none());
+    }
+
+    #[test]
+    fn serializes_a_performance_result_for_the_vscode_view() {
+        let result = PerformanceResult {
+            source_path: PathBuf::from("/tmp/Module.bsl"),
+            line: DebugMeasuredLine {
+                line: 17,
+                frequency: 3.0,
+                duration: 12.5,
+                pure_duration: 10.0,
+                server_call_signal: 1.0,
+            },
+        };
+        let value = performance_result_value(&result);
+        assert_eq!(value["source"]["path"], "/tmp/Module.bsl");
+        assert_eq!(value["line"], 17);
+        assert_eq!(value["duration"], 12.5);
+        assert_eq!(value["pureDuration"], 10.0);
     }
 
     #[test]

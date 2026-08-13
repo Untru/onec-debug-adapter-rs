@@ -64,6 +64,10 @@ Do not install this extension and the original `vsc-onec-debug-adapter` together
 
 The adapter supports attach and launch, source/conditional/hit-count/log breakpoints, runtime-error breakpoints, stepping, stack frames, local variables and expression evaluation. `launch` starts the platform's `1cv8c` client from `platformPath`; `attach` expects an already available 1C debug server. Both requests require `rootProject` for reliable BSL source mapping, breakpoints and source navigation; `attach` does not need `platformPath` because it does not start the platform. For an unregistered file infobase, set `infoBase` to `/F /path/to/ib`; launch uses `/F` and does not modify the user's 1C launcher list. For a server base use `/Sserver\\base` in JSON (one backslash reaches 1C).
 
+## BSL performance measurements
+
+With an active 1C debug session, open **Run and Debug** → **Замеры производительности**, click **Start**, select an attached target, exercise the code in the thin client, then click **Stop**. The platform sends a line-level result which appears in the view and as inline source annotations. Values are platform duration units, not adapter-converted milliseconds. The platform may return results for more than one attached target; results without a matching `rootProject`/`extensions` source are omitted.
+
 For launch authentication use `userName` and `password`; they map to 1C thin-client switches `/N` and `/P`. Prefer a masked `${input:...}` password prompt shown above. A literal password is supported for automated environments, but it is exposed in `launch.json` and in the local process command line.
 
 On macOS, select the server-platform directory that contains both `1cv8c` and `dbgs`, normally `/opt/1cv8/<version>` (for example `/opt/1cv8/8.3.27.1508`). A `1cv8.app` bundle and its `Contents/MacOS` directory only provide the GUI application and cannot be used for `launch`.
