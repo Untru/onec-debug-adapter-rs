@@ -15,6 +15,13 @@ const {
   uniqueConfigurationName,
   validatePlatformDirectory
 } = require("../setup-wizard");
+const {
+  designerArguments,
+  designerExecutable,
+  discoverInfoBaseExtensions,
+  parseDesignerExtensionList,
+  validateConnection
+} = require("../extension-inventory");
 
 test("reads an extension name from Properties", () => {
   assert.equal(
@@ -146,6 +153,81 @@ test("rejects a macOS GUI application bundle as a launch platform", async () => 
       validatePlatformDirectory(bundle, { platform: "darwin" }),
       /\/opt\/1cv8\/<версия>/
     );
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("builds a read-only Designer command for a file infobase", () => {
+  assert.deepEqual(
+    designerArguments({ kind: "file", value: "/tmp/demo-ib" }, "/tmp/result.txt"),
+    [
+      "DESIGNER",
+      "/F",
+      "/tmp/demo-ib",
+      "/DisableStartupMessages",
+      "/DumpDBCfgList",
+      "-AllExtensions",
+      "/Out",
+      "/tmp/result.txt"
+    ]
+  );
+});
+
+test("reads localized and plain extension names from Designer result", () => {
+  const output = [
+    "Список расширений конфигурации:",
+    "Расширение: Моя_Проверка",
+    "- Sales Extension",
+    "Моя_Проверка",
+    "Информация"
+  ].join("\n");
+  assert.deepEqual(parseDesignerExtensionList(output), ["Моя_Проверка", "Sales Extension"]);
+});
+
+test("reads a UTF-16LE Designer result", () => {
+  const utf16 = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from("Ext_One\r\nExt_Two\r\n", "utf16le")
+  ]);
+  assert.deepEqual(parseDesignerExtensionList(utf16), ["Ext_One", "Ext_Two"]);
+});
+
+test("does not allow credentials in the Designer inventory connection", () => {
+  assert.throws(
+    () => validateConnection({ kind: "registered", value: 'Srv="demo";Pwd="secret";' }),
+    /учётные данные/
+  );
+});
+
+test("finds the Designer executable in a Windows version directory", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-designer-"));
+  const bin = path.join(temporary, "bin");
+  await fs.mkdir(bin);
+  await fs.writeFile(path.join(bin, "1cv8.exe"), "");
+  try {
+    assert.equal(
+      await designerExecutable(temporary, { platform: "win32" }),
+      path.join(bin, "1cv8.exe")
+    );
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("cleans private Designer output after reading extension inventory", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-inventory-test-"));
+  try {
+    const names = await discoverInfoBaseExtensions({
+      executable: "/mock/1cv8",
+      tempRoot: temporary,
+      connection: { kind: "registered", value: "Demo" },
+      run: async (_executable, args) => {
+        await fs.writeFile(args[args.length - 1], "Extension: Ext_One\nExt_Two\n");
+      }
+    });
+    assert.deepEqual(names, ["Ext_One", "Ext_Two"]);
+    assert.deepEqual(await fs.readdir(temporary), []);
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }

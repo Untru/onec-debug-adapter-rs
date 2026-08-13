@@ -17,7 +17,7 @@
   ],
   "main": "./extension.js",
   "scripts": {
-    "check": "node --check extension.js && node --check setup-wizard.js",
+    "check": "node --check extension.js && node --check setup-wizard.js && node --check extension-inventory.js",
     "test": "node --test test/*.test.js"
   },
   "activationEvents": [
