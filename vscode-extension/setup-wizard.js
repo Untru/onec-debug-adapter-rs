@@ -351,7 +351,11 @@ function configurationSummary(configuration) {
   }
   if (configuration.launchMode === "standaloneServer") {
     lines.push(`HTTP автономного сервера: ${configuration.standaloneServerHost}:${configuration.standaloneServerPort}${configuration.standaloneServerBase}`);
-    lines.push(`Порты автономного сервера: direct ${configuration.standaloneServerDirectRegPort} (${configuration.standaloneServerDirectRange}), SSH ${configuration.standaloneServerSshPort}`);
+    const directPorts = `direct ${configuration.standaloneServerDirectRegPort} (${configuration.standaloneServerDirectRange})`;
+    const sshPort = Number.isInteger(configuration.standaloneServerSshPort)
+      ? `, SSH ${configuration.standaloneServerSshPort}`
+      : "";
+    lines.push(`Порты автономного сервера: ${directPorts}${sshPort}`);
     lines.push(`Данные автономного сервера: ${configuration.standaloneServerDataPath}`);
   }
   lines.push(`Сервер отладки: ${configuration.debugServerHost}:${configuration.debugServerPort}`);

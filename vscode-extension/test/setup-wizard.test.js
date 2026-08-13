@@ -69,12 +69,12 @@ test("summarizes the standalone server launch mode", () => {
     standaloneServerBase: "/",
     standaloneServerDirectRegPort: 1941,
     standaloneServerDirectRange: "1960:1991",
-    standaloneServerSshPort: 1943,
     standaloneServerDataPath: "/work/.vscode/onec-standalone-server",
     autoAttachTypes: ["ManagedClient", "Server"]
   });
   assert.match(summary, /автономный сервер \(ibsrv\)/);
   assert.match(summary, /localhost:8314\//);
+  assert.doesNotMatch(summary, /SSH/);
 });
 
 test("recognizes credential-bearing connection strings", () => {

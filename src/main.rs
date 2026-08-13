@@ -377,17 +377,18 @@ fn launch_standalone_server(
         .standalone_server_data_path
         .as_deref()
         .filter(|value| !value.trim().is_empty());
-    // `ibsrv` otherwise claims the global default direct/SSH ports.  Use an
+    // `ibsrv` otherwise claims the global default direct port.  Use an
     // isolated default for debugger-owned standalone servers so a normal
     // platform service (or another development tool) on 1541 does not make a
-    // selected standalone launch fail.
+    // selected standalone launch fail.  Do not enable its SSH endpoint by
+    // default: on macOS/Linux it requires a host key which ordinary debugging
+    // sessions neither need nor should create.
     let direct_registration_port = arguments.standalone_server_direct_reg_port.unwrap_or(1941);
     let direct_range = arguments
         .standalone_server_direct_range
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("1960:1991");
-    let ssh_port = arguments.standalone_server_ssh_port.unwrap_or(1943);
     let debugger_url = debug_server
         .endpoint()
         .strip_suffix("/e1crdbg")
@@ -399,8 +400,10 @@ fn launch_standalone_server(
         .arg(format!("--http-port={http_port}"))
         .arg(format!("--http-base={http_base}"))
         .arg(format!("--direct-regport={direct_registration_port}"))
-        .arg(format!("--direct-range={direct_range}"))
-        .arg(format!("--ssh-port={ssh_port}"));
+        .arg(format!("--direct-range={direct_range}"));
+    if let Some(ssh_port) = arguments.standalone_server_ssh_port {
+        command.arg(format!("--ssh-port={ssh_port}"));
+    }
     if let Some(data_path) = data_path {
         command.arg(format!("--data={data_path}"));
     }

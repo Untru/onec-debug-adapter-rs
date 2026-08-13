@@ -1,4 +1,5 @@
 const fs = require("node:fs");
+const net = require("node:net");
 const path = require("node:path");
 const vscode = require("vscode");
 const {
@@ -442,7 +443,7 @@ async function chooseLaunchMode(selectedInfoBase, request) {
       },
       {
         label: "Автономный сервер 1С (ibsrv)",
-        description: "Запустить локальный ibsrv с HTTP-отладкой на localhost:1550",
+        description: "Запустить локальный ibsrv; отладчик создаст временный dbgs",
         detail: "Подходит для отдельного серверного/веб-клиентского контура; сервер остановится вместе с отладочной сессией.",
         mode: "standaloneServer"
       }
@@ -453,6 +454,20 @@ async function chooseLaunchMode(selectedInfoBase, request) {
     }
   );
   return selected?.mode;
+}
+
+async function firstAvailableLocalPort(first = 8314, last = 8399) {
+  for (let port = first; port <= last; port += 1) {
+    const available = await new Promise((resolve) => {
+      const server = net.createServer();
+      server.once("error", () => resolve(false));
+      server.listen({ host: "127.0.0.1", port }, () => {
+        server.close(() => resolve(true));
+      });
+    });
+    if (available) return port;
+  }
+  return undefined;
 }
 
 async function inputInfoBase(title, prompt) {
@@ -743,12 +758,16 @@ async function configureDebugger() {
     configuration.platformPath = selectedPlatformPath;
     configuration.platformVersion = "LATEST";
     if (launchMode === "standaloneServer") {
+      const standaloneServerPort = await firstAvailableLocalPort();
+      if (!standaloneServerPort) {
+        await vscode.window.showErrorMessage("Не найден свободный порт для HTTP автономного сервера (8314–8399).");
+        return;
+      }
       configuration.standaloneServerHost = "localhost";
-      configuration.standaloneServerPort = 8314;
+      configuration.standaloneServerPort = standaloneServerPort;
       configuration.standaloneServerBase = "/";
       configuration.standaloneServerDirectRegPort = 1941;
       configuration.standaloneServerDirectRange = "1960:1991";
-      configuration.standaloneServerSshPort = 1943;
       configuration.standaloneServerDataPath = path.join(
         workspaceFolder.uri.fsPath,
         ".vscode",

@@ -158,8 +158,7 @@
               },
               "standaloneServerSshPort": {
                 "type": "number",
-                "default": 1943,
-                "description": "Dedicated ibsrv SSH port when launchMode is standaloneServer"
+                "description": "Optional ibsrv SSH port. SSH requires a configured host key and is disabled by the setup wizard."
               },
               "infoBase": {
                 "type": "string",
