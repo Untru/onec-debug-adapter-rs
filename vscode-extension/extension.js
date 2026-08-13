@@ -6,9 +6,11 @@ const {
   configurationSummary,
   defaultPlatformRoots,
   discoverIbaseEntries,
+  discoverV8ProjectEntries,
   discoverPlatformDirectories,
   hasCredentials,
   isSamePath,
+  mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
   uniqueConfigurationName,
@@ -383,21 +385,29 @@ async function chooseExtensionsFromInfoBase(workspaceFolder, baseProject, extens
   return selected;
 }
 
-async function chooseRequest() {
+async function chooseRequest(selectedInfoBase) {
+  const serverProjectBase = selectedInfoBase?.requiresRegisteredLaunch === true;
   const selected = await vscode.window.showQuickPick(
     [
-      {
+      ...(serverProjectBase ? [] : [{
         label: "Запуск 1С",
         description: "Запустить клиент 1С и подключить отладчик",
         request: "launch"
-      },
+      }]),
       {
         label: "Подключение к отладчику",
-        description: "Подключиться к уже доступному серверу отладки",
+        description: serverProjectBase
+          ? "Для серверной базы из .v8-project.json; запуск требует регистрации в списке 1С"
+          : "Подключиться к уже доступному серверу отладки",
         request: "attach"
       }
     ],
-    { title: "1C: Режим отладки" }
+    {
+      title: "1C: Режим отладки",
+      placeHolder: serverProjectBase
+        ? "Для запуска выберите эту базу из реестра 1С или добавьте её в список запуска"
+        : undefined
+    }
   );
   return selected?.request;
 }
@@ -426,10 +436,14 @@ function ibaseChoiceDescription(entry) {
 }
 
 async function chooseInfoBase(workspaceFolder) {
-  const entries = await vscode.window.withProgress(
+  const [launcherEntries, projectEntries] = await vscode.window.withProgress(
     { location: vscode.ProgressLocation.Window, title: "1C: Поиск зарегистрированных информационных баз" },
-    () => discoverIbaseEntries()
+    () => Promise.all([
+      discoverIbaseEntries(),
+      discoverV8ProjectEntries(workspaceFolder.uri.fsPath)
+    ])
   );
+  const entries = mergeInfoBaseEntries(projectEntries, launcherEntries);
   while (true) {
     const selected = await vscode.window.showQuickPick(
       [
@@ -438,7 +452,10 @@ async function chooseInfoBase(workspaceFolder) {
           description: ibaseChoiceDescription(entry),
           detail: entry.hasStoredCredentials
             ? "Сохранённые учётные данные останутся только в списке запуска 1С"
-            : undefined,
+            : entry.source === "v8-project"
+              ? `из .v8-project.json${entry.isDefault ? " — база по умолчанию" : ""}`
+              : undefined,
+          picked: entry.isDefault === true,
           entry
         })),
         {
@@ -459,6 +476,23 @@ async function chooseInfoBase(workspaceFolder) {
     );
     if (!selected) return undefined;
     if (selected.entry) {
+      if (selected.entry.source === "v8-project" && selected.entry.kind === "file") {
+        return {
+          infoBase: selected.entry.filePath,
+          inventoryConnection: { kind: "file", value: selected.entry.filePath }
+        };
+      }
+      if (selected.entry.source === "v8-project" && selected.entry.kind === "server") {
+        const connection = `${selected.entry.server}\\${selected.entry.reference}`;
+        return {
+          // A direct debug-server alias is sufficient for attach. Launch still
+          // needs a 1C-launcher registration until native /S startup exists.
+          infoBase: connection,
+          infoBaseAlias: selected.entry.reference,
+          inventoryConnection: { kind: "server", value: connection },
+          requiresRegisteredLaunch: true
+        };
+      }
       // Keep a launcher registration by name even for a file base: a stored
       // password must never be copied into launch.json or shown by the wizard.
       return {
@@ -606,7 +640,7 @@ async function configureDebugger() {
     : await chooseExtensionsManually(workspaceFolder, rootProject);
   if (!extensions) return;
 
-  const request = await chooseRequest();
+  const request = await chooseRequest(selectedInfoBase);
   if (!request) return;
 
   const debugServer = await chooseDebugServer();
@@ -626,6 +660,7 @@ async function configureDebugger() {
     debugServerPort: debugServer.port,
     autoAttachTypes: ["ManagedClient", "Server"]
   };
+  if (selectedInfoBase.infoBaseAlias) configuration.infoBaseAlias = selectedInfoBase.infoBaseAlias;
   if (aliasResult.value) configuration.infoBaseAlias = aliasResult.value;
   if (extensions.length) configuration.extensions = extensions.map((extension) => extension.path);
   if (request === "launch") {

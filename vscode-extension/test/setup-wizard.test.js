@@ -7,11 +7,14 @@ const {
   defaultIbaseFiles,
   discoverPlatformDirectories,
   discoverIbaseEntries,
+  discoverV8ProjectEntries,
   hasCredentials,
   isSamePath,
+  mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
   parseIbaseV8i,
+  parseV8Project,
   uniqueConfigurationName,
   validatePlatformDirectory
 } = require("../setup-wizard");
@@ -132,6 +135,83 @@ test("uses native launcher locations for each operating system", () => {
     defaultIbaseFiles("win32", { APPDATA: "C:\\Users\\test\\AppData\\Roaming" }),
     ["C:\\Users\\test\\AppData\\Roaming/1C/1CEStart/ibases.v8i"]
   );
+});
+
+test("reads only safe v8-project infobase identity fields and resolves file paths", () => {
+  const projectFile = "/work/demo/.v8-project.json";
+  const entries = parseV8Project(projectFile, JSON.stringify({
+    default: "autotest",
+    databases: [
+      {
+        id: "autotest",
+        name: "Автотесты",
+        type: "file",
+        path: "build/ib",
+        password: "must not be read",
+        aliases: ["ignored"]
+      },
+      {
+        id: "server",
+        name: "Серверная",
+        type: "server",
+        server: "srv-1c",
+        ref: "Accounting",
+        usr: "ignored"
+      },
+      {
+        id: "bad",
+        type: "file",
+        path: "File=/tmp/ib;Pwd=secret;"
+      }
+    ]
+  }));
+  assert.deepEqual(entries, [
+    {
+      id: "autotest",
+      name: "Автотесты",
+      kind: "file",
+      filePath: "/work/demo/build/ib",
+      isDefault: true,
+      source: "v8-project",
+      sourceFile: projectFile
+    },
+    {
+      id: "server",
+      name: "Серверная",
+      kind: "server",
+      server: "srv-1c",
+      reference: "Accounting",
+      isDefault: false,
+      source: "v8-project",
+      sourceFile: projectFile
+    }
+  ]);
+  assert.equal(JSON.stringify(entries).includes("password"), false);
+  assert.equal(JSON.stringify(entries).includes("usr"), false);
+});
+
+test("discovers a workspace v8-project file and prefers its default while deduplicating launcher bases", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-v8-project-"));
+  const projectFile = path.join(temporary, ".v8-project.json");
+  await fs.writeFile(projectFile, JSON.stringify({
+    default: "demo",
+    databases: [{ id: "demo", name: "Из проекта", type: "file", path: "ib" }]
+  }));
+  try {
+    const projectEntries = await discoverV8ProjectEntries(temporary);
+    const merged = mergeInfoBaseEntries(projectEntries, [{
+      name: "В лаунчере",
+      kind: "file",
+      filePath: path.join(temporary, "ib"),
+      sourceFile: "/tmp/ibases.v8i"
+    }]);
+    assert.equal(merged.length, 1);
+    assert.equal(merged[0].name, "Из проекта");
+    assert.equal(merged[0].isDefault, true);
+    assert.equal(merged[0].source, "v8-project");
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
 });
 
 test("compares normalized paths", () => {

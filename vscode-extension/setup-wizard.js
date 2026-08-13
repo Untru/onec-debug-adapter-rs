@@ -117,6 +117,114 @@ async function discoverIbaseEntries(options = {}) {
   return entries.sort((first, second) => first.name.localeCompare(second.name));
 }
 
+function safeProjectText(value) {
+  return typeof value === "string" && value.trim() && !hasCredentials(value)
+    ? value.trim()
+    : undefined;
+}
+
+function resolveProjectFilePath(projectFile, value) {
+  const candidate = safeProjectText(value);
+  if (!candidate) return undefined;
+  return path.isAbsolute(candidate)
+    ? path.normalize(candidate)
+    : path.resolve(path.dirname(projectFile), candidate);
+}
+
+function projectDefaultId(project) {
+  if (typeof project?.default === "string") return project.default.trim();
+  if (project?.default && typeof project.default === "object") {
+    return safeProjectText(project.default.id);
+  }
+  return undefined;
+}
+
+/**
+ * Read only the connection identity fields supported by v8-project.json.
+ * In particular, credentials and arbitrary connection-string properties are
+ * intentionally neither parsed nor returned to the caller.
+ */
+function parseV8Project(projectFile, contents) {
+  let project;
+  try {
+    project = typeof contents === "string" ? JSON.parse(contents) : contents;
+  } catch {
+    return [];
+  }
+  if (!project || typeof project !== "object" || !Array.isArray(project.databases)) return [];
+  const defaultId = projectDefaultId(project);
+  const entries = [];
+  for (const database of project.databases) {
+    if (!database || typeof database !== "object") continue;
+    const id = safeProjectText(database.id);
+    const name = safeProjectText(database.name) ?? id;
+    const type = safeProjectText(database.type)?.toLocaleLowerCase();
+    if (!id || !name || !["file", "server"].includes(type)) continue;
+    if (type === "file") {
+      const filePath = resolveProjectFilePath(projectFile, database.path);
+      if (!filePath) continue;
+      entries.push({
+        id,
+        name,
+        kind: "file",
+        filePath,
+        isDefault: id === defaultId,
+        source: "v8-project",
+        sourceFile: projectFile
+      });
+      continue;
+    }
+    const server = safeProjectText(database.server);
+    const reference = safeProjectText(database.ref);
+    if (!server || !reference) continue;
+    entries.push({
+      id,
+      name,
+      kind: "server",
+      server,
+      reference,
+      isDefault: id === defaultId,
+      source: "v8-project",
+      sourceFile: projectFile
+    });
+  }
+  return entries;
+}
+
+async function discoverV8ProjectEntries(workspaceDirectory, options = {}) {
+  const fileSystem = options.fileSystem ?? fs.promises;
+  const projectFile = options.projectFile ?? path.join(workspaceDirectory, ".v8-project.json");
+  const contents = await fileSystem.readFile(projectFile, "utf8").catch(() => undefined);
+  return contents === undefined ? [] : parseV8Project(projectFile, contents);
+}
+
+function infoBaseIdentity(entry) {
+  if (!entry || typeof entry !== "object") return undefined;
+  const normalized = (value) => process.platform === "win32" ? value.toLocaleLowerCase() : value;
+  if (entry.kind === "file" && typeof entry.filePath === "string") {
+    return `file:${normalized(path.normalize(entry.filePath))}`;
+  }
+  if (entry.kind === "server" && typeof entry.server === "string" && typeof entry.reference === "string") {
+    return `server:${normalized(entry.server)}\\${normalized(entry.reference)}`;
+  }
+  return typeof entry.name === "string" ? `registered:${normalized(entry.name)}` : undefined;
+}
+
+function mergeInfoBaseEntries(projectEntries, launcherEntries) {
+  const merged = [];
+  const seen = new Set();
+  for (const entry of [...projectEntries, ...launcherEntries]) {
+    const identity = infoBaseIdentity(entry);
+    if (!identity || seen.has(identity)) continue;
+    seen.add(identity);
+    merged.push(entry);
+  }
+  return merged.sort((first, second) => {
+    if (first.isDefault !== second.isDefault) return first.isDefault ? -1 : 1;
+    return first.name.localeCompare(second.name);
+  });
+}
+
 function uniqueConfigurationName(configurations, preferred) {
   const names = new Set(
     configurations
@@ -283,14 +391,18 @@ module.exports = {
   containsPlatformBinaries,
   defaultPlatformRoots,
   discoverIbaseEntries,
+  discoverV8ProjectEntries,
   discoverPlatformDirectories,
   hasCredentials,
+  infoBaseIdentity,
   isSamePath,
   isMacApplicationBundle,
   isPlatformVersionDirectory,
+  mergeInfoBaseEntries,
   noExtensionSourceChoices,
   parseExtensionName,
   parseIbaseV8i,
+  parseV8Project,
   platformBinaryDirectory,
   platformExecutables,
   uniqueConfigurationName,
