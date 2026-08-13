@@ -1,11 +1,11 @@
 const childProcess = require("node:child_process");
 const fs = require("node:fs");
-const os = require("node:os");
 const path = require("node:path");
 
 const { hasCredentials } = require("./setup-wizard");
 
 const DEFAULT_TIMEOUT_MS = 45_000;
+const TERMINATE_GRACE_MS = 5_000;
 const MAX_CAPTURED_OUTPUT_BYTES = 1_048_576;
 
 function executableName(platform = process.platform) {
@@ -43,17 +43,16 @@ function validateConnection(connection) {
   return { kind: connection.kind, value: connection.value.trim() };
 }
 
-function designerArguments(connection, resultFile) {
+function designerArguments(connection) {
   const checked = validateConnection(connection);
   return [
     "DESIGNER",
     checked.kind === "file" ? "/F" : checked.kind === "server" ? "/S" : "/IBName",
     checked.value,
     "/DisableStartupMessages",
+    "/DisableStartupDialogs",
     "/DumpDBCfgList",
-    "-AllExtensions",
-    "/Out",
-    resultFile
+    "-AllExtensions"
   ];
 }
 
@@ -75,6 +74,10 @@ function normalizeListedName(line) {
   );
   const value = (labelled?.[1] ?? line).replace(/^(?:[-*•]|\d+[.)])\s*/, "").trim();
   if (!value || isResultNoise(value)) return undefined;
+  // This command's stdout is the canonical list source.  Keep the parser
+  // defensive nevertheless: an unexpected diagnostic must not turn a
+  // connection string with stored credentials into a selectable name.
+  if (hasCredentials(value)) return undefined;
   // Names of 1C metadata objects never contain an angle bracket or a line
   // break.  This rejects common status/log fragments without restricting
   // localized or space-containing extension names.
@@ -105,6 +108,7 @@ function parseDesignerExtensionList(contents) {
 function run(executable, args, options = {}) {
   const spawn = options.spawn ?? childProcess.spawn;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const terminateGraceMs = options.terminateGraceMs ?? TERMINATE_GRACE_MS;
   return new Promise((resolve, reject) => {
     const stdout = [];
     let stdoutLength = 0;
@@ -129,59 +133,75 @@ function run(executable, args, options = {}) {
       stdoutLength += accepted.length;
     });
     let timedOut = false;
-    const timer = setTimeout(() => {
+    let settled = false;
+    let timer;
+    let killTimer;
+    const timeoutError = () => new Error("Конфигуратор не ответил при чтении списка расширений.");
+    const clearTimers = () => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+    };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimers();
+      callback(value);
+    };
+    timer = setTimeout(() => {
+      if (settled) return;
       timedOut = true;
-      child.kill();
+      // A Designer process can keep running when a platform dialog appears.
+      // Give a normal termination a short grace period before escalating.
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => {
+        if (settled) return;
+        child.kill("SIGKILL");
+        // SIGKILL should close a real child shortly, but settling here also
+        // prevents the VS Code progress UI from hanging on a broken process.
+        settle(reject, timeoutError());
+      }, terminateGraceMs);
     }, timeoutMs);
     child.once("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+      settle(reject, error);
     });
     child.once("close", (code) => {
-      clearTimeout(timer);
       if (timedOut) {
-        reject(new Error("Конфигуратор не ответил при чтении списка расширений."));
+        settle(reject, timeoutError());
       } else if (code !== 0) {
-        reject(new Error("Не удалось прочитать список расширений из информационной базы."));
+        settle(reject, new Error("Не удалось прочитать список расширений из информационной базы."));
       } else {
-        resolve(Buffer.concat(stdout));
+        settle(resolve, Buffer.concat(stdout));
       }
     });
   });
 }
 
 /**
- * Reads extension names from an infobase without modifying it.  The only
- * artifact is a private temporary Designer result file, removed in finally.
- * The caller receives only extension names, never command output or secrets.
+ * Reads extension names from an infobase without modifying it.  Designer's
+ * /DumpDBCfgList writes the list to standard output; /Out is deliberately not
+ * used because it contains service diagnostics instead of the list itself.
+ * The caller receives only parsed extension names, never raw command output.
  */
 async function discoverInfoBaseExtensions(options) {
-  const fileSystem = options.fileSystem ?? fs.promises;
-  const tempRoot = options.tempRoot ?? os.tmpdir();
-  const temporary = await fileSystem.mkdtemp(path.join(tempRoot, "onec-extension-list-"));
-  const outputFile = path.join(temporary, "designer-result.txt");
-  try {
-    const executable = options.executable ?? await designerExecutable(options.platformDirectory, options);
-    const standardOutput = await (options.run ?? run)(
-      executable,
-      designerArguments(options.connection, outputFile),
-      options
-    );
-    const output = await fileSystem.readFile(outputFile).catch(() => standardOutput ?? Buffer.alloc(0));
-    return parseDesignerExtensionList(output);
-  } finally {
-    await fileSystem.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
-  }
+  const executable = options.executable ?? await designerExecutable(options.platformDirectory, options);
+  const standardOutput = await (options.run ?? run)(
+    executable,
+    designerArguments(options.connection),
+    options
+  );
+  return parseDesignerExtensionList(standardOutput ?? Buffer.alloc(0));
 }
 
 module.exports = {
   DEFAULT_TIMEOUT_MS,
   MAX_CAPTURED_OUTPUT_BYTES,
+  TERMINATE_GRACE_MS,
   decodeDesignerOutput,
   designerArguments,
   designerExecutable,
   discoverInfoBaseExtensions,
   executableName,
   parseDesignerExtensionList,
+  run,
   validateConnection
 };

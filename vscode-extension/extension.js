@@ -361,8 +361,10 @@ async function chooseExtensionSource(workspaceFolder, extensionName, candidates)
         placeHolder: "Выберите соответствующий каталог исходников"
       }
     );
-    if (!picked) return undefined;
-    if (picked.skip) return undefined;
+    // Esc cancels the complete wizard.  That is distinct from the explicit
+    // per-extension skip, which keeps configuring the remaining extensions.
+    if (!picked) return { cancelled: true };
+    if (picked.skip) return { skipped: true };
     let selected = picked.extension;
     if (picked.browse) {
       const directory = (await pickDirectory(
@@ -383,7 +385,7 @@ async function chooseExtensionSource(workspaceFolder, extensionName, candidates)
       );
       continue;
     }
-    return selected;
+    return { extension: selected };
   }
 }
 
@@ -391,7 +393,9 @@ async function chooseExtensionsFromInfoBase(workspaceFolder, baseProject, extens
   const candidates = await discoveredExtensionCandidates(workspaceFolder, baseProject);
   const selected = [];
   for (const extensionName of extensionNames) {
-    const extension = await chooseExtensionSource(workspaceFolder, extensionName, candidates);
+    const result = await chooseExtensionSource(workspaceFolder, extensionName, candidates);
+    if (result.cancelled) return undefined;
+    const extension = result.extension;
     if (extension && !selected.some((item) => isSamePath(item.path, extension.path))) {
       selected.push(extension);
     }

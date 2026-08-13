@@ -1,7 +1,9 @@
 const assert = require("node:assert/strict");
+const { EventEmitter } = require("node:events");
 const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
+const { PassThrough } = require("node:stream");
 const test = require("node:test");
 const {
   commonInfoBaseListPaths,
@@ -27,6 +29,7 @@ const {
   designerExecutable,
   discoverInfoBaseExtensions,
   parseDesignerExtensionList,
+  run,
   validateConnection
 } = require("../extension-inventory");
 
@@ -220,18 +223,21 @@ test("uses native launcher locations for each operating system", () => {
   assert.deepEqual(
     defaultIbaseFiles("darwin", { HOME: "/Users/test" }),
     [
-      "/Users/test/.1C/1cestart/ibases.v8i",
-      "/Users/test/Library/Application Support/1C/1CEStart/ibases.v8i",
-      "/Users/test/.1cv8/1C/1CEStart/ibases.v8i"
+      path.join("/Users/test", ".1C", "1cestart", "ibases.v8i"),
+      path.join("/Users/test", "Library", "Application Support", "1C", "1CEStart", "ibases.v8i"),
+      path.join("/Users/test", ".1cv8", "1C", "1CEStart", "ibases.v8i")
     ]
   );
   assert.deepEqual(
     defaultIbaseFiles("linux", { HOME: "/home/test" }),
-    ["/home/test/.1C/1cestart/ibases.v8i", "/home/test/.1cv8/1C/1CEStart/ibases.v8i"]
+    [
+      path.join("/home/test", ".1C", "1cestart", "ibases.v8i"),
+      path.join("/home/test", ".1cv8", "1C", "1CEStart", "ibases.v8i")
+    ]
   );
   assert.deepEqual(
     defaultIbaseFiles("win32", { APPDATA: "C:\\Users\\test\\AppData\\Roaming" }),
-    ["C:\\Users\\test\\AppData\\Roaming/1C/1CEStart/ibases.v8i"]
+    [path.join("C:\\Users\\test\\AppData\\Roaming", "1C", "1CEStart", "ibases.v8i")]
   );
 });
 
@@ -363,26 +369,24 @@ test("rejects a macOS GUI application bundle as a launch platform", async () => 
   }
 });
 
-test("builds a read-only Designer command for a file infobase", () => {
+test("builds a read-only Designer command that writes the list to stdout", () => {
   assert.deepEqual(
-    designerArguments({ kind: "file", value: "/tmp/demo-ib" }, "/tmp/result.txt"),
+    designerArguments({ kind: "file", value: "/tmp/demo-ib" }),
     [
       "DESIGNER",
       "/F",
       "/tmp/demo-ib",
       "/DisableStartupMessages",
+      "/DisableStartupDialogs",
       "/DumpDBCfgList",
-      "-AllExtensions",
-      "/Out",
-      "/tmp/result.txt"
+      "-AllExtensions"
     ]
   );
 });
 
 test("builds a read-only Designer command for a server infobase", () => {
   const args = designerArguments(
-    { kind: "server", value: "srv-1c\\accounting" },
-    "/tmp/result.txt"
+    { kind: "server", value: "srv-1c\\accounting" }
   );
   assert.deepEqual(args.slice(0, 4), ["DESIGNER", "/S", "srv-1c\\accounting", "/DisableStartupMessages"]);
 });
@@ -396,6 +400,13 @@ test("reads localized and plain extension names from Designer result", () => {
     "Информация"
   ].join("\n");
   assert.deepEqual(parseDesignerExtensionList(output), ["Моя_Проверка", "Sales Extension"]);
+});
+
+test("does not turn unexpected credential output into an extension name", () => {
+  assert.deepEqual(
+    parseDesignerExtensionList("Pwd=secret\nExtension: Safe_Extension\n"),
+    ["Safe_Extension"]
+  );
 });
 
 test("reads a UTF-16LE Designer result", () => {
@@ -428,37 +439,60 @@ test("finds the Designer executable in a Windows version directory", async () =>
   }
 });
 
-test("cleans private Designer output after reading extension inventory", async () => {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-inventory-test-"));
-  try {
-    const names = await discoverInfoBaseExtensions({
-      executable: "/mock/1cv8",
-      tempRoot: temporary,
-      connection: { kind: "registered", value: "Demo" },
-      run: async (_executable, args) => {
-        await fs.writeFile(args[args.length - 1], "Extension: Ext_One\nExt_Two\n");
-      }
-    });
-    assert.deepEqual(names, ["Ext_One", "Ext_Two"]);
-    assert.deepEqual(await fs.readdir(temporary), []);
-  } finally {
-    await fs.rm(temporary, { recursive: true, force: true });
-  }
+test("reads the Designer extension inventory only from canonical stdout", async () => {
+  let receivedArguments;
+  const names = await discoverInfoBaseExtensions({
+    executable: "/mock/1cv8",
+    connection: { kind: "registered", value: "Demo" },
+    run: async (_executable, args) => {
+      receivedArguments = args;
+      return Buffer.from("Extension: Ext_One\nExt_Two\n");
+    }
+  });
+  assert.deepEqual(names, ["Ext_One", "Ext_Two"]);
+  assert.equal(receivedArguments.includes("/Out"), false);
 });
 
-test("uses Designer standard output when a platform version does not create /Out", async () => {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-inventory-stdout-"));
-  try {
-    const names = await discoverInfoBaseExtensions({
-      executable: "/mock/1cv8",
-      tempRoot: temporary,
-      connection: { kind: "registered", value: "Demo" },
-      run: async () => Buffer.from("Extension: Stdout_Only\n")
-    });
-    assert.deepEqual(names, ["Stdout_Only"]);
-  } finally {
-    await fs.rm(temporary, { recursive: true, force: true });
-  }
+test("escalates a timed-out Designer process to SIGKILL and settles", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    return true;
+  };
+  await assert.rejects(
+    run("/mock/1cv8", [], {
+      spawn: () => child,
+      timeoutMs: 5,
+      terminateGraceMs: 5
+    }),
+    /не ответил/
+  );
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("clears the SIGKILL escalation when Designer closes after SIGTERM", async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  const signals = [];
+  child.kill = (signal) => {
+    signals.push(signal);
+    if (signal === "SIGTERM") {
+      setTimeout(() => child.emit("close", null), 1);
+    }
+    return true;
+  };
+  await assert.rejects(
+    run("/mock/1cv8", [], {
+      spawn: () => child,
+      timeoutMs: 5,
+      terminateGraceMs: 25
+    }),
+    /не ответил/
+  );
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.deepEqual(signals, ["SIGTERM"]);
 });
 
 test("discovers a runnable Windows platform under Program Files style root", async () => {
