@@ -4,6 +4,9 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  commonInfoBaseListPaths,
+  decodePlatformText,
+  defaultIbaseDirectories,
   defaultIbaseFiles,
   discoverPlatformDirectories,
   discoverIbaseEntries,
@@ -101,7 +104,8 @@ test("discovers ibases from standard files and keeps no credentials", async () =
     assert.deepEqual(entries.map((entry) => [entry.name, entry.filePath, entry.hasStoredCredentials]), [
       ["Safe", "/tmp/safe", false],
       ["Secure", undefined, true],
-      ["Shared", "/tmp/first", false]
+      ["Shared", "/tmp/first", false],
+      ["Shared", "/tmp/second", false]
     ]);
     const secure = entries.find((entry) => entry.name === "Secure");
     assert.deepEqual(secure, {
@@ -118,6 +122,53 @@ test("discovers ibases from standard files and keeps no credentials", async () =
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
+});
+
+test("reads personal and CommonInfoBases lists from the 1CEStart directory", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-common-ibases-"));
+  const startup = path.join(temporary, ".1C", "1cestart");
+  const shared = path.join(temporary, "shared", "company.v8i");
+  await fs.mkdir(path.dirname(shared), { recursive: true });
+  await fs.mkdir(startup, { recursive: true });
+  await fs.writeFile(path.join(startup, "ibases.v8i"), [
+    "[Personal]",
+    "Connect=File=\"/tmp/personal\";",
+    "[Duplicate]",
+    "Connect=Srvr=\"srv\";Ref=\"same\";"
+  ].join("\n"));
+  await fs.writeFile(shared, [
+    "[Company]",
+    "Connect=Srvr=\"srv\";Ref=\"company\";",
+    "[Duplicate]",
+    "Connect=Srvr=\"srv\";Ref=\"same\";"
+  ].join("\n"));
+  const config = "CommonInfoBases=../../shared/company.v8i;\n";
+  await fs.writeFile(
+    path.join(startup, "1cestart.cfg"),
+    Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from(config, "utf16le")])
+  );
+  try {
+    const entries = await discoverIbaseEntries({
+      startupDirectories: [startup],
+      files: [path.join(startup, "ibases.v8i")]
+    });
+    assert.deepEqual(entries.map((entry) => [entry.name, entry.sourceFile]), [
+      ["Company", shared],
+      ["Duplicate", path.join(startup, "ibases.v8i")],
+      ["Personal", path.join(startup, "ibases.v8i")]
+    ]);
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("parses CommonInfoBases and platform encodings", () => {
+  assert.deepEqual(commonInfoBaseListPaths("Other=ignored\nCommonInfoBases=one.v8i; two.v8i \n"), ["one.v8i", "two.v8i"]);
+  assert.equal(
+    decodePlatformText(Buffer.concat([Buffer.from([0xff, 0xfe]), Buffer.from("CommonInfoBases=x", "utf16le")])),
+    "CommonInfoBases=x"
+  );
+  assert.equal(decodePlatformText(Buffer.from([0xef, 0xbb, 0xbf, 0x5b, 0x44, 0x5d])), "[D]");
 });
 
 test("imports an explicitly selected ibases.v8i outside standard launcher locations", async () => {
@@ -169,18 +220,24 @@ test("uses native launcher locations for each operating system", () => {
   assert.deepEqual(
     defaultIbaseFiles("darwin", { HOME: "/Users/test" }),
     [
+      "/Users/test/.1C/1cestart/ibases.v8i",
       "/Users/test/Library/Application Support/1C/1CEStart/ibases.v8i",
       "/Users/test/.1cv8/1C/1CEStart/ibases.v8i"
     ]
   );
   assert.deepEqual(
     defaultIbaseFiles("linux", { HOME: "/home/test" }),
-    ["/home/test/.1cv8/1C/1CEStart/ibases.v8i"]
+    ["/home/test/.1C/1cestart/ibases.v8i", "/home/test/.1cv8/1C/1CEStart/ibases.v8i"]
   );
   assert.deepEqual(
     defaultIbaseFiles("win32", { APPDATA: "C:\\Users\\test\\AppData\\Roaming" }),
     ["C:\\Users\\test\\AppData\\Roaming/1C/1CEStart/ibases.v8i"]
   );
+});
+
+test("uses the current 1CEStart startup directory on macOS and Linux", () => {
+  assert.equal(defaultIbaseDirectories("darwin", { HOME: "/Users/test" })[0], "/Users/test/.1C/1cestart");
+  assert.equal(defaultIbaseDirectories("linux", { HOME: "/home/test" })[0], "/home/test/.1C/1cestart");
 });
 
 test("reads only safe v8-project infobase identity fields and resolves file paths", () => {

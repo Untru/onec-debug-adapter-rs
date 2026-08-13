@@ -81,36 +81,104 @@ function parseIbaseV8i(contents) {
   return entries;
 }
 
-function defaultIbaseFiles(platform = process.platform, environment = process.env) {
+function defaultIbaseDirectories(platform = process.platform, environment = process.env) {
   if (platform === "win32") {
     return [environment.APPDATA, environment.LOCALAPPDATA]
       .filter(Boolean)
-      .map((directory) => path.join(directory, "1C", "1CEStart", "ibases.v8i"));
+      .map((directory) => path.join(directory, "1C", "1CEStart"));
   }
   const home = environment.HOME;
   if (!home) return [];
   if (platform === "darwin") {
     return [
-      path.join(home, "Library", "Application Support", "1C", "1CEStart", "ibases.v8i"),
-      path.join(home, ".1cv8", "1C", "1CEStart", "ibases.v8i")
+      path.join(home, ".1C", "1cestart"),
+      path.join(home, "Library", "Application Support", "1C", "1CEStart"),
+      path.join(home, ".1cv8", "1C", "1CEStart")
     ];
   }
-  return [path.join(home, ".1cv8", "1C", "1CEStart", "ibases.v8i")];
+  return [
+    path.join(home, ".1C", "1cestart"),
+    path.join(home, ".1cv8", "1C", "1CEStart")
+  ];
+}
+
+function defaultIbaseFiles(platform = process.platform, environment = process.env) {
+  return defaultIbaseDirectories(platform, environment)
+    .map((directory) => path.join(directory, "ibases.v8i"));
+}
+
+function decodePlatformText(value) {
+  if (typeof value === "string") return value.replace(/^\uFEFF/, "");
+  if (!Buffer.isBuffer(value)) return undefined;
+  if (value.length >= 2 && value[0] === 0xff && value[1] === 0xfe) {
+    return value.subarray(2).toString("utf16le");
+  }
+  if (value.length >= 3 && value[0] === 0xef && value[1] === 0xbb && value[2] === 0xbf) {
+    return value.subarray(3).toString("utf8");
+  }
+  return value.toString("utf8");
+}
+
+function commonInfoBaseListPaths(contents) {
+  if (typeof contents !== "string") return [];
+  const paths = [];
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    const separator = line.indexOf("=");
+    if (separator <= 0) continue;
+    if (line.slice(0, separator).trim().toLocaleLowerCase() !== "commoninfobases") continue;
+    const value = line.slice(separator + 1).trim();
+    if (value) paths.push(...value.split(";").map((item) => item.trim()).filter(Boolean));
+  }
+  return paths;
+}
+
+async function readPlatformText(file, fileSystem = fs.promises) {
+  const raw = await fileSystem.readFile(file).catch(() => undefined);
+  return decodePlatformText(raw);
+}
+
+function uniquePaths(paths, platform = process.platform) {
+  const seen = new Set();
+  return paths.filter((file) => {
+    const normalized = path.resolve(file);
+    const key = platform === "win32" ? normalized.toLocaleLowerCase() : normalized;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function launcherEntryKey(entry, platform = process.platform) {
+  const normalize = (value) => platform === "win32" ? value.toLocaleLowerCase() : value;
+  if (entry.kind === "file" && entry.filePath) return `${normalize(entry.name)}|file:${normalize(entry.filePath)}`;
+  if (entry.kind === "server" && entry.server && entry.reference) {
+    return `${normalize(entry.name)}|server:${normalize(entry.server)}\\${normalize(entry.reference)}`;
+  }
+  return `${normalize(entry.name)}|unknown`;
 }
 
 async function discoverIbaseEntries(options = {}) {
   const platform = options.platform ?? process.platform;
   const fileSystem = options.fileSystem ?? fs.promises;
-  const files = options.files ?? defaultIbaseFiles(platform, options.environment);
+  const primaryFiles = options.files ?? defaultIbaseFiles(platform, options.environment);
+  const startupDirectories = options.startupDirectories
+    ?? (options.files ? primaryFiles.map((file) => path.dirname(file)) : defaultIbaseDirectories(platform, options.environment));
+  const files = [...primaryFiles];
+  for (const directory of uniquePaths(startupDirectories, platform)) {
+    const config = await readPlatformText(path.join(directory, "1cestart.cfg"), fileSystem);
+    if (!config) continue;
+    files.push(...commonInfoBaseListPaths(config).map((file) => path.resolve(directory, file)));
+  }
   const entries = [];
-  const seenNames = new Set();
-  for (const file of files) {
-    const contents = await fileSystem.readFile(file, "utf8").catch(() => undefined);
+  const seen = new Set();
+  for (const file of uniquePaths(files, platform)) {
+    const contents = await readPlatformText(file, fileSystem);
     if (contents === undefined) continue;
     for (const entry of parseIbaseV8i(contents)) {
-      const key = entry.name.toLocaleLowerCase();
-      if (seenNames.has(key)) continue;
-      seenNames.add(key);
+      const key = launcherEntryKey(entry, platform);
+      if (seen.has(key)) continue;
+      seen.add(key);
       entries.push({ ...entry, sourceFile: file });
     }
   }
@@ -401,6 +469,9 @@ module.exports = {
   canonicalDirectory,
   connectionProperty,
   configurationSummary,
+  commonInfoBaseListPaths,
+  decodePlatformText,
+  defaultIbaseDirectories,
   defaultIbaseFiles,
   containsPlatformBinaries,
   defaultPlatformRoots,
@@ -420,6 +491,7 @@ module.exports = {
   parseV8Project,
   platformBinaryDirectory,
   platformExecutables,
+  readPlatformText,
   uniqueConfigurationName,
   validatePlatformDirectory
 };
