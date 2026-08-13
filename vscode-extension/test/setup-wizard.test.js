@@ -4,11 +4,14 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  defaultIbaseFiles,
   discoverPlatformDirectories,
+  discoverIbaseEntries,
   hasCredentials,
   isSamePath,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseIbaseV8i,
   uniqueConfigurationName,
   validatePlatformDirectory
 } = require("../setup-wizard");
@@ -35,6 +38,71 @@ test("makes a generated debug configuration name unique", () => {
 test("recognizes credential-bearing connection strings", () => {
   assert.equal(hasCredentials('File="/tmp/ib";Pwd="secret";'), true);
   assert.equal(hasCredentials("DemoBase"), false);
+});
+
+test("parses safe file and server entries from ibases.v8i", () => {
+  const entries = parseIbaseV8i(`
+[Файловая база]
+Connect=File="/Users/me/1c/demo";
+
+[Серверная база]
+Connect=Srvr="srv-1c";Ref="Accounting";
+
+[Не переносить пароль]
+Connect=Srvr="srv-1c";Ref="Secret";Usr="admin";Pwd="secret";
+`);
+  assert.deepEqual(entries, [
+    {
+      name: "Файловая база",
+      kind: "file",
+      filePath: "/Users/me/1c/demo",
+      server: undefined,
+      reference: undefined
+    },
+    {
+      name: "Серверная база",
+      kind: "server",
+      filePath: undefined,
+      server: "srv-1c",
+      reference: "Accounting"
+    }
+  ]);
+});
+
+test("discovers ibases from standard files and keeps no credentials", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-ibases-"));
+  const first = path.join(temporary, "first.v8i");
+  const second = path.join(temporary, "second.v8i");
+  await fs.writeFile(first, "[Shared]\nConnect=File=\"/tmp/first\";\n[Safe]\nConnect=File=\"/tmp/safe\";");
+  await fs.writeFile(second, "[Shared]\nConnect=File=\"/tmp/second\";\n[Secure]\nConnect=Srvr=\"host\";Ref=\"db\";Pwd=\"no\";");
+  try {
+    const entries = await discoverIbaseEntries({ files: [first, second] });
+    assert.deepEqual(entries.map((entry) => [entry.name, entry.filePath]), [
+      ["Safe", "/tmp/safe"],
+      ["Shared", "/tmp/first"]
+    ]);
+    assert.equal(entries.some((entry) => entry.name === "Secure"), false);
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("uses native launcher locations for each operating system", () => {
+  assert.deepEqual(
+    defaultIbaseFiles("darwin", { HOME: "/Users/test" }),
+    [
+      "/Users/test/Library/Application Support/1C/1CEStart/ibases.v8i",
+      "/Users/test/.1cv8/1C/1CEStart/ibases.v8i"
+    ]
+  );
+  assert.deepEqual(
+    defaultIbaseFiles("linux", { HOME: "/home/test" }),
+    ["/home/test/.1cv8/1C/1CEStart/ibases.v8i"]
+  );
+  assert.deepEqual(
+    defaultIbaseFiles("win32", { APPDATA: "C:\\Users\\test\\AppData\\Roaming" }),
+    ["C:\\Users\\test\\AppData\\Roaming/1C/1CEStart/ibases.v8i"]
+  );
 });
 
 test("compares normalized paths", () => {
@@ -77,6 +145,22 @@ test("rejects a macOS GUI application bundle as a launch platform", async () => 
     await assert.rejects(
       validatePlatformDirectory(bundle, { platform: "darwin" }),
       /\/opt\/1cv8\/<версия>/
+    );
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("discovers a runnable Windows platform under Program Files style root", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-platform-win-"));
+  const root = path.join(temporary, "1cv8");
+  const binaryDirectory = path.join(root, "8.3.28.1000", "bin");
+  await fs.mkdir(binaryDirectory, { recursive: true });
+  await Promise.all(["1cv8c.exe", "dbgs.exe"].map((name) => fs.writeFile(path.join(binaryDirectory, name), "")));
+  try {
+    assert.deepEqual(
+      await discoverPlatformDirectories({ platform: "win32", roots: [root] }),
+      [path.join(await fs.realpath(root), "8.3.28.1000", "bin")]
     );
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });

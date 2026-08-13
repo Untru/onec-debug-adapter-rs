@@ -3,6 +3,11 @@ const fs = require("node:fs");
 
 const CREDENTIAL_PATTERN = /(?:^|[;\s])(pwd|password|usr|user)\s*=/i;
 
+// `ibases.v8i` is an INI-like file maintained by the 1C launcher.  It is not
+// a credentials store for the wizard: entries that carry credentials are
+// deliberately ignored instead of being copied to launch.json.
+const IBASE_SECTION_PATTERN = /^\s*\[([^\]]+)\]\s*$/;
+
 function parseExtensionName(xml) {
   if (typeof xml !== "string") {
     return undefined;
@@ -22,6 +27,92 @@ function decodeXmlText(value) {
 
 function hasCredentials(value) {
   return typeof value === "string" && CREDENTIAL_PATTERN.test(value);
+}
+
+function connectionProperty(connection, property) {
+  if (typeof connection !== "string") return undefined;
+  const expected = property.toLocaleLowerCase();
+  for (const part of connection.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator < 0) continue;
+    if (part.slice(0, separator).trim().toLocaleLowerCase() !== expected) continue;
+    const value = part.slice(separator + 1).trim();
+    return value.replace(/^"(.*)"$/, "$1").trim() || undefined;
+  }
+  return undefined;
+}
+
+function parseIbaseV8i(contents) {
+  if (typeof contents !== "string") return [];
+  const entries = [];
+  let name;
+  let connect;
+  const finish = () => {
+    if (!name || !connect || hasCredentials(connect)) return;
+    const filePath = connectionProperty(connect, "File");
+    const server = connectionProperty(connect, "Srvr");
+    const reference = connectionProperty(connect, "Ref");
+    entries.push({
+      name,
+      kind: filePath ? "file" : (server && reference ? "server" : "unknown"),
+      filePath,
+      server,
+      reference
+    });
+  };
+  for (const rawLine of contents.split(/\r?\n/)) {
+    const section = rawLine.match(IBASE_SECTION_PATTERN);
+    if (section) {
+      finish();
+      name = section[1].trim();
+      connect = undefined;
+      continue;
+    }
+    if (!name) continue;
+    const separator = rawLine.indexOf("=");
+    if (separator < 0) continue;
+    if (rawLine.slice(0, separator).trim().toLocaleLowerCase() === "connect") {
+      connect = rawLine.slice(separator + 1).trim();
+    }
+  }
+  finish();
+  return entries;
+}
+
+function defaultIbaseFiles(platform = process.platform, environment = process.env) {
+  if (platform === "win32") {
+    return [environment.APPDATA, environment.LOCALAPPDATA]
+      .filter(Boolean)
+      .map((directory) => path.join(directory, "1C", "1CEStart", "ibases.v8i"));
+  }
+  const home = environment.HOME;
+  if (!home) return [];
+  if (platform === "darwin") {
+    return [
+      path.join(home, "Library", "Application Support", "1C", "1CEStart", "ibases.v8i"),
+      path.join(home, ".1cv8", "1C", "1CEStart", "ibases.v8i")
+    ];
+  }
+  return [path.join(home, ".1cv8", "1C", "1CEStart", "ibases.v8i")];
+}
+
+async function discoverIbaseEntries(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const fileSystem = options.fileSystem ?? fs.promises;
+  const files = options.files ?? defaultIbaseFiles(platform, options.environment);
+  const entries = [];
+  const seenNames = new Set();
+  for (const file of files) {
+    const contents = await fileSystem.readFile(file, "utf8").catch(() => undefined);
+    if (contents === undefined) continue;
+    for (const entry of parseIbaseV8i(contents)) {
+      const key = entry.name.toLocaleLowerCase();
+      if (seenNames.has(key)) continue;
+      seenNames.add(key);
+      entries.push({ ...entry, sourceFile: file });
+    }
+  }
+  return entries.sort((first, second) => first.name.localeCompare(second.name));
 }
 
 function uniqueConfigurationName(configurations, preferred) {
@@ -152,7 +243,10 @@ async function validatePlatformDirectory(directory, options = {}) {
 }
 
 function defaultPlatformRoots(platform = process.platform) {
-  if (platform === "darwin" || platform === "linux") return ["/opt/1cv8"];
+  if (platform === "darwin") return ["/opt/1cv8"];
+  if (platform === "linux") {
+    return ["/opt/1cv8", "/opt/1C/v8.3/x86_64", "/opt/1C/v8.3/i386"];
+  }
   if (platform === "win32") {
     return [process.env["ProgramFiles"], process.env["ProgramFiles(x86)"]]
       .filter(Boolean)
@@ -181,9 +275,12 @@ async function discoverPlatformDirectories(options = {}) {
 
 module.exports = {
   canonicalDirectory,
+  connectionProperty,
   configurationSummary,
+  defaultIbaseFiles,
   containsPlatformBinaries,
   defaultPlatformRoots,
+  discoverIbaseEntries,
   discoverPlatformDirectories,
   hasCredentials,
   isSamePath,
@@ -191,6 +288,7 @@ module.exports = {
   isPlatformVersionDirectory,
   noExtensionSourceChoices,
   parseExtensionName,
+  parseIbaseV8i,
   platformBinaryDirectory,
   platformExecutables,
   uniqueConfigurationName,
