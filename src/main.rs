@@ -26,6 +26,7 @@ struct Adapter {
     debug_server: Option<DebugServer>,
     debug_session: Option<DebugUiSession>,
     file_debug_server: Option<Child>,
+    standalone_server: Option<Child>,
     debuggee: Option<Child>,
     pending_debuggee: Option<PendingDebuggee>,
     debuggee_launcher: DebuggeeLauncher,
@@ -131,6 +132,7 @@ impl Default for Adapter {
             debug_server: None,
             debug_session: None,
             file_debug_server: None,
+            standalone_server: None,
             debuggee: None,
             pending_debuggee: None,
             debuggee_launcher: launch_debuggee,
@@ -215,11 +217,32 @@ struct ConnectionArguments {
     root_project: Option<String>,
     platform_path: Option<String>,
     platform_version: Option<String>,
+    #[serde(default)]
+    launch_mode: LaunchMode,
+    standalone_server_host: Option<String>,
+    standalone_server_port: Option<u16>,
+    standalone_server_base: Option<String>,
+    standalone_server_data_path: Option<String>,
+    standalone_server_direct_reg_port: Option<u16>,
+    standalone_server_direct_range: Option<String>,
+    standalone_server_ssh_port: Option<u16>,
     extensions: Option<Vec<String>>,
     auto_attach_types: Option<Vec<String>>,
     #[serde(default)]
     trace: bool,
     trace_file: Option<String>,
+}
+
+/// The process that owns the application being debugged.  `client` keeps the
+/// established behaviour: start a local `dbgs` for a file base and then start
+/// `1cv8c`.  `standaloneServer` starts the platform's `ibsrv` with its HTTP
+/// debugger enabled; it is intended for a local web-client/server scenario.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum LaunchMode {
+    #[default]
+    Client,
+    StandaloneServer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +253,11 @@ struct InfoBaseTarget {
     /// entry, this must be passed to the client with `/F` and never requires
     /// registering the base in `ibases.v8i`.
     direct_file_path: Option<PathBuf>,
+    /// A file-base path resolved from a registered launcher entry.  It is
+    /// deliberately separate from `direct_file_path`: the ordinary client
+    /// still starts registered bases via `/IBName`, while `ibsrv` needs the
+    /// concrete directory passed to `--database-path`.
+    registered_file_path: Option<PathBuf>,
 }
 
 const FILE_INFOBASE_ALIAS: &str = "DefAlias";
@@ -303,6 +331,86 @@ fn launch_debuggee(
         .with_context(|| format!("cannot start 1C client {}", executable.display()))
 }
 
+fn launch_standalone_server(
+    arguments: &ConnectionArguments,
+    info_base_target: &InfoBaseTarget,
+) -> Result<Child> {
+    let platform_path = arguments
+        .platform_path
+        .as_deref()
+        .context("standaloneServer launch requires platformPath")?;
+    let platform_bin = platform_bin(
+        &PathBuf::from(platform_path),
+        arguments.platform_version.as_deref(),
+    )?;
+    let executable = platform_bin.join(if cfg!(windows) { "ibsrv.exe" } else { "ibsrv" });
+    if !executable.is_file() {
+        anyhow::bail!(
+            "1C standalone server executable was not found at {}",
+            executable.display()
+        );
+    }
+    let database_path = info_base_target
+        .direct_file_path
+        .as_ref()
+        .or(info_base_target.registered_file_path.as_ref())
+        .context("standaloneServer launch requires a file infobase")?;
+    if !database_path.is_dir() {
+        anyhow::bail!(
+            "standaloneServer database directory was not found at {}",
+            database_path.display()
+        );
+    }
+    let http_host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("localhost");
+    let http_port = arguments.standalone_server_port.unwrap_or(8314);
+    let http_base = arguments
+        .standalone_server_base
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("/");
+    let data_path = arguments
+        .standalone_server_data_path
+        .as_deref()
+        .filter(|value| !value.trim().is_empty());
+    // `ibsrv` otherwise claims the global default direct/SSH ports.  Use an
+    // isolated default for debugger-owned standalone servers so a normal
+    // platform service (or another development tool) on 1541 does not make a
+    // selected standalone launch fail.
+    let direct_registration_port = arguments.standalone_server_direct_reg_port.unwrap_or(1941);
+    let direct_range = arguments
+        .standalone_server_direct_range
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("1960:1991");
+    let ssh_port = arguments.standalone_server_ssh_port.unwrap_or(1943);
+    let debug_host = arguments.debug_server_host.trim();
+    if debug_host.is_empty() {
+        anyhow::bail!("standaloneServer launch requires debugServerHost");
+    }
+    let mut command = Command::new(&executable);
+    command
+        .arg(format!("--database-path={}", database_path.display()))
+        .arg(format!("--http-address={http_host}"))
+        .arg(format!("--http-port={http_port}"))
+        .arg(format!("--http-base={http_base}"))
+        .arg(format!("--direct-regport={direct_registration_port}"))
+        .arg(format!("--direct-range={direct_range}"))
+        .arg(format!("--ssh-port={ssh_port}"));
+    if let Some(data_path) = data_path {
+        command.arg(format!("--data={data_path}"));
+    }
+    command
+        .arg("--debug=http")
+        .arg(format!("--debug-address={debug_host}"))
+        .arg(format!("--debug-port={}", arguments.debug_server_port))
+        .spawn()
+        .with_context(|| format!("cannot start 1C standalone server {}", executable.display()))
+}
+
 /// Starts the 1C RDBG sidecar used by a file infobase and waits until it
 /// publishes its selected port. Server infobases have a persistent RDBG
 /// service, but a file infobase needs this process for each debug session.
@@ -371,6 +479,24 @@ fn launch_file_debug_server(platform_bin: &Path, host: &str) -> Result<SpawnedDe
         server: DebugServer::new(host, port)?,
         child,
     })
+}
+
+/// `ibsrv` opens its debugger asynchronously after its process starts.  Keep
+/// the wait bounded and retry the exact same attach request; unlike long-poll
+/// event requests this is a short control request and never overlaps another
+/// Debug UI ping.
+fn attach_debug_ui_after_startup(server: &DebugServer, alias: &str) -> Result<DebugUiSession> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last_error = None;
+    while Instant::now() < deadline {
+        match server.attach_debug_ui(alias) {
+            Ok(session) => return Ok(session),
+            Err(error) => last_error = Some(error),
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("standalone debug server did not start")))
+        .context("cannot connect to the standalone 1C debug server within 10 seconds")
 }
 
 fn debug_server_port_from_notification(notification: &str) -> Result<u16> {
@@ -501,6 +627,7 @@ fn info_base_target(arguments: &ConnectionArguments) -> Result<InfoBaseTarget> {
         alias,
         is_file,
         direct_file_path,
+        registered_file_path: launcher_target.and_then(|target| target.registered_file_path),
     })
 }
 
@@ -701,16 +828,20 @@ fn launcher_info_base(ibases: &str, info_base_name: &str) -> Option<InfoBaseTarg
             .to_ascii_lowercase()
             .starts_with("file=")
         {
+            let registered_file_path =
+                extract_connection_property(connect, "File").map(PathBuf::from);
             return Some(InfoBaseTarget {
                 alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
                 direct_file_path: None,
+                registered_file_path,
             });
         }
         return extract_connection_property(connect, "Ref").map(|alias| InfoBaseTarget {
             alias,
             is_file: false,
             direct_file_path: None,
+            registered_file_path: None,
         });
     }
     None
@@ -866,23 +997,34 @@ impl Adapter {
             None => None,
         };
         let info_base = info_base_target(&arguments)?;
+        if !launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+            anyhow::bail!("launchMode standaloneServer requires request launch");
+        }
         let trace_info_base = info_base.alias.clone();
-        let mut spawned_debug_server = if launch && info_base.is_file {
-            let platform_path = arguments
-                .platform_path
-                .as_deref()
-                .context("launch requires platformPath for a file infobase")?;
-            let platform_bin = platform_bin(
-                &PathBuf::from(platform_path),
-                arguments.platform_version.as_deref(),
-            )?;
-            Some(launch_file_debug_server(
-                &platform_bin,
-                &arguments.debug_server_host,
-            )?)
-        } else {
-            None
-        };
+        let launch_mode = arguments.launch_mode;
+        let mut standalone_server =
+            if launch && arguments.launch_mode == LaunchMode::StandaloneServer {
+                Some(launch_standalone_server(&arguments, &info_base)?)
+            } else {
+                None
+            };
+        let mut spawned_debug_server =
+            if launch && info_base.is_file && arguments.launch_mode == LaunchMode::Client {
+                let platform_path = arguments
+                    .platform_path
+                    .as_deref()
+                    .context("launch requires platformPath for a file infobase")?;
+                let platform_bin = platform_bin(
+                    &PathBuf::from(platform_path),
+                    arguments.platform_version.as_deref(),
+                )?;
+                Some(launch_file_debug_server(
+                    &platform_bin,
+                    &arguments.debug_server_host,
+                )?)
+            } else {
+                None
+            };
         let server = spawned_debug_server
             .as_ref()
             .map(|spawned| spawned.server.clone())
@@ -890,11 +1032,19 @@ impl Adapter {
                 &arguments.debug_server_host,
                 arguments.debug_server_port,
             )?);
-        let session = match server.attach_debug_ui(&info_base.alias) {
+        let attach_result = if standalone_server.is_some() {
+            attach_debug_ui_after_startup(&server, &info_base.alias)
+        } else {
+            server.attach_debug_ui(&info_base.alias)
+        };
+        let session = match attach_result {
             Ok(session) => session,
             Err(error) => {
                 if let Some(spawned) = &mut spawned_debug_server {
                     terminate_child(&mut spawned.child);
+                }
+                if let Some(standalone) = &mut standalone_server {
+                    terminate_child(standalone);
                 }
                 return Err(error);
             }
@@ -904,6 +1054,9 @@ impl Adapter {
             let _ = server.detach_debug_ui(&session);
             if let Some(spawned) = &mut spawned_debug_server {
                 terminate_child(&mut spawned.child);
+            }
+            if let Some(standalone) = &mut standalone_server {
+                terminate_child(standalone);
             }
             return Err(error);
         }
@@ -915,10 +1068,12 @@ impl Adapter {
         self.debug_server = Some(server);
         self.debug_session = Some(session);
         self.file_debug_server = spawned_debug_server.map(|spawned| spawned.child);
-        self.pending_debuggee = launch.then_some(PendingDebuggee {
-            arguments,
-            info_base,
-        });
+        self.standalone_server = standalone_server;
+        self.pending_debuggee =
+            (launch && arguments.launch_mode == LaunchMode::Client).then_some(PendingDebuggee {
+                arguments,
+                info_base,
+            });
         // Do not replace a held ping with a new one: RDBG can leave the
         // original server-side request alive after its client disconnects.
         // Session replacement is not expected while attached; if it occurs,
@@ -934,6 +1089,7 @@ impl Adapter {
             "session.started",
             json!({
                 "request": if launch { "launch" } else { "attach" },
+                "launchMode": format!("{:?}", launch_mode),
                 "infoBase": trace_info_base,
                 "rdbgEndpoint": self.debug_server.as_ref().map(DebugServer::endpoint),
             }),
@@ -975,6 +1131,9 @@ impl Adapter {
         self.pending_debuggee = None;
         if let Some(mut debug_server) = self.file_debug_server.take() {
             terminate_child(&mut debug_server);
+        }
+        if let Some(mut standalone_server) = self.standalone_server.take() {
+            terminate_child(&mut standalone_server);
         }
         if let Some(mut debuggee) = self.debuggee.take() {
             terminate_child(&mut debuggee);
@@ -2359,6 +2518,14 @@ mod tests {
                     root_project: None,
                     platform_path: None,
                     platform_version: None,
+                    launch_mode: LaunchMode::Client,
+                    standalone_server_host: None,
+                    standalone_server_port: None,
+                    standalone_server_base: None,
+                    standalone_server_data_path: None,
+                    standalone_server_direct_reg_port: None,
+                    standalone_server_direct_range: None,
+                    standalone_server_ssh_port: None,
                     extensions: None,
                     auto_attach_types: None,
                     trace: false,
@@ -2368,6 +2535,7 @@ mod tests {
                     alias: "Demo".to_owned(),
                     is_file: false,
                     direct_file_path: None,
+                    registered_file_path: None,
                 },
             }),
             ..Default::default()
@@ -2651,6 +2819,7 @@ Connect=File="/tmp/demo";
                 alias: "DefAlias".to_owned(),
                 is_file: true,
                 direct_file_path: None,
+                registered_file_path: Some(PathBuf::from("/tmp/demo")),
             })
         );
         assert_eq!(
@@ -2659,9 +2828,47 @@ Connect=File="/tmp/demo";
                 alias: "Accounting".to_owned(),
                 is_file: false,
                 direct_file_path: None,
+                registered_file_path: None,
             })
         );
         assert_eq!(launcher_info_base(ibases, "Missing"), None);
+    }
+
+    #[test]
+    fn parses_the_standalone_server_launch_configuration() {
+        let arguments: ConnectionArguments = serde_json::from_value(json!({
+            "infoBase": "/tmp/demo",
+            "platformPath": "/opt/1cv8/8.3.27",
+            "launchMode": "standaloneServer",
+            "standaloneServerHost": "127.0.0.1",
+            "standaloneServerPort": 8315,
+            "standaloneServerBase": "/demo",
+            "standaloneServerDataPath": "/tmp/standalone-state",
+            "standaloneServerDirectRegPort": 1941,
+            "standaloneServerDirectRange": "1960:1991",
+            "standaloneServerSshPort": 1943
+        }))
+        .unwrap();
+        assert_eq!(arguments.launch_mode, LaunchMode::StandaloneServer);
+        assert_eq!(
+            arguments.standalone_server_host.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(arguments.standalone_server_port, Some(8315));
+        assert_eq!(arguments.standalone_server_base.as_deref(), Some("/demo"));
+        assert_eq!(
+            arguments.standalone_server_data_path.as_deref(),
+            Some("/tmp/standalone-state")
+        );
+        assert_eq!(arguments.standalone_server_direct_reg_port, Some(1941));
+        assert_eq!(
+            arguments.standalone_server_direct_range.as_deref(),
+            Some("1960:1991")
+        );
+        assert_eq!(arguments.standalone_server_ssh_port, Some(1943));
+
+        let default_arguments: ConnectionArguments = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(default_arguments.launch_mode, LaunchMode::Client);
     }
 
     #[test]
@@ -2736,6 +2943,7 @@ Connect=File="/tmp/demo";
                 alias: "Service".to_owned(),
                 is_file: false,
                 direct_file_path: None,
+                registered_file_path: None,
             })
         );
         assert_eq!(
@@ -2744,6 +2952,7 @@ Connect=File="/tmp/demo";
                 alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
                 direct_file_path: None,
+                registered_file_path: Some(PathBuf::from("/tmp/demo")),
             })
         );
         assert!(
@@ -2796,6 +3005,14 @@ Connect=File="/tmp/demo";
             root_project: None,
             platform_path: None,
             platform_version: None,
+            launch_mode: LaunchMode::Client,
+            standalone_server_host: None,
+            standalone_server_port: None,
+            standalone_server_base: None,
+            standalone_server_data_path: None,
+            standalone_server_direct_reg_port: None,
+            standalone_server_direct_range: None,
+            standalone_server_ssh_port: None,
             extensions: None,
             auto_attach_types: None,
             trace: false,
@@ -2807,6 +3024,7 @@ Connect=File="/tmp/demo";
                 alias: FILE_INFOBASE_ALIAS.to_owned(),
                 is_file: true,
                 direct_file_path: Some(directory.clone()),
+                registered_file_path: None,
             }
         );
 
@@ -2825,6 +3043,14 @@ Connect=File="/tmp/demo";
             root_project: None,
             platform_path: None,
             platform_version: None,
+            launch_mode: LaunchMode::Client,
+            standalone_server_host: None,
+            standalone_server_port: None,
+            standalone_server_base: None,
+            standalone_server_data_path: None,
+            standalone_server_direct_reg_port: None,
+            standalone_server_direct_range: None,
+            standalone_server_ssh_port: None,
             extensions: None,
             auto_attach_types: None,
             trace: false,

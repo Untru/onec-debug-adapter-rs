@@ -6,6 +6,7 @@ const path = require("node:path");
 const { PassThrough } = require("node:stream");
 const test = require("node:test");
 const {
+  configurationSummary,
   commonInfoBaseListPaths,
   decodePlatformText,
   defaultIbaseDirectories,
@@ -50,6 +51,30 @@ test("does not accept a name outside Properties when Properties exists", () => {
 test("makes a generated debug configuration name unique", () => {
   const configurations = [{ name: "1C: Demo (запуск)" }, { name: "1C: Demo (запуск) (2)" }];
   assert.equal(uniqueConfigurationName(configurations, "1C: Demo (запуск)"), "1C: Demo (запуск) (3)");
+});
+
+test("summarizes the standalone server launch mode", () => {
+  const summary = configurationSummary({
+    name: "1C: Demo (launch)",
+    request: "launch",
+    launchMode: "standaloneServer",
+    rootProject: "/work/src",
+    infoBase: "/work/ib",
+    platformPath: "/opt/1cv8/8.3.27",
+    platformVersion: "LATEST",
+    debugServerHost: "localhost",
+    debugServerPort: 1550,
+    standaloneServerHost: "localhost",
+    standaloneServerPort: 8314,
+    standaloneServerBase: "/",
+    standaloneServerDirectRegPort: 1941,
+    standaloneServerDirectRange: "1960:1991",
+    standaloneServerSshPort: 1943,
+    standaloneServerDataPath: "/work/.vscode/onec-standalone-server",
+    autoAttachTypes: ["ManagedClient", "Server"]
+  });
+  assert.match(summary, /автономный сервер \(ibsrv\)/);
+  assert.match(summary, /localhost:8314\//);
 });
 
 test("recognizes credential-bearing connection strings", () => {

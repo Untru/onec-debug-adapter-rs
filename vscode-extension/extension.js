@@ -430,6 +430,31 @@ async function chooseRequest(selectedInfoBase) {
   return selected?.request;
 }
 
+async function chooseLaunchMode(selectedInfoBase, request) {
+  if (request !== "launch") return "client";
+  if (!selectedInfoBase.supportsStandaloneServer) return "client";
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Обычный клиент 1С (рекомендуется)",
+        description: "Запустить 1cv8c; для файловой базы адаптер сам поднимет временный dbgs",
+        mode: "client"
+      },
+      {
+        label: "Автономный сервер 1С (ibsrv)",
+        description: "Запустить локальный ibsrv с HTTP-отладкой на localhost:1550",
+        detail: "Подходит для отдельного серверного/веб-клиентского контура; сервер остановится вместе с отладочной сессией.",
+        mode: "standaloneServer"
+      }
+    ],
+    {
+      title: "1C: Способ запуска файловой базы",
+      placeHolder: "Выберите, кто будет запускать базу"
+    }
+  );
+  return selected?.mode;
+}
+
 async function inputInfoBase(title, prompt) {
   while (true) {
     const value = await vscode.window.showInputBox({
@@ -517,7 +542,8 @@ async function chooseInfoBase(workspaceFolder) {
       if (selected.entry.source === "v8-project" && selected.entry.kind === "file") {
         return {
           infoBase: selected.entry.filePath,
-          inventoryConnection: { kind: "file", value: selected.entry.filePath }
+          inventoryConnection: { kind: "file", value: selected.entry.filePath },
+          supportsStandaloneServer: true
         };
       }
       if (selected.entry.source === "v8-project" && selected.entry.kind === "server") {
@@ -535,7 +561,8 @@ async function chooseInfoBase(workspaceFolder) {
       // password must never be copied into launch.json or shown by the wizard.
       return {
         infoBase: selected.entry.name,
-        inventoryConnection: { kind: "registered", value: selected.entry.name }
+        inventoryConnection: { kind: "registered", value: selected.entry.name },
+        supportsStandaloneServer: selected.entry.kind === "file"
       };
     }
     if (selected.manual) {
@@ -543,13 +570,21 @@ async function chooseInfoBase(workspaceFolder) {
         "1C: Имя зарегистрированной базы",
         "Введите только имя базы, без строки подключения и пароля"
       );
-      return infoBase ? { infoBase, inventoryConnection: { kind: "registered", value: infoBase } } : undefined;
+      return infoBase ? {
+        infoBase,
+        inventoryConnection: { kind: "registered", value: infoBase },
+        supportsStandaloneServer: false
+      } : undefined;
     }
     const directory = (await pickDirectory("1C: Каталог файловой информационной базы", workspaceFolder.uri))?.[0];
     if (!directory) continue;
     try {
       const infoBase = await canonicalDirectory(directory);
-      return { infoBase, inventoryConnection: { kind: "file", value: infoBase } };
+      return {
+        infoBase,
+        inventoryConnection: { kind: "file", value: infoBase },
+        supportsStandaloneServer: true
+      };
     } catch (error) {
       await vscode.window.showErrorMessage(`Не удалось выбрать файловую базу: ${error.message}`);
     }
@@ -680,6 +715,8 @@ async function configureDebugger() {
 
   const request = await chooseRequest(selectedInfoBase);
   if (!request) return;
+  const launchMode = await chooseLaunchMode(selectedInfoBase, request);
+  if (!launchMode) return;
 
   const debugServer = await chooseDebugServer();
   if (!debugServer) return;
@@ -692,6 +729,7 @@ async function configureDebugger() {
     name: uniqueConfigurationName(existing, `1C: ${path.basename(rootProject)} (${mode})`),
     type: "onec",
     request,
+    launchMode,
     rootProject,
     infoBase: selectedInfoBase.infoBase,
     debugServerHost: debugServer.host,
@@ -704,6 +742,19 @@ async function configureDebugger() {
   if (request === "launch") {
     configuration.platformPath = selectedPlatformPath;
     configuration.platformVersion = "LATEST";
+    if (launchMode === "standaloneServer") {
+      configuration.standaloneServerHost = "localhost";
+      configuration.standaloneServerPort = 8314;
+      configuration.standaloneServerBase = "/";
+      configuration.standaloneServerDirectRegPort = 1941;
+      configuration.standaloneServerDirectRange = "1960:1991";
+      configuration.standaloneServerSshPort = 1943;
+      configuration.standaloneServerDataPath = path.join(
+        workspaceFolder.uri.fsPath,
+        ".vscode",
+        "onec-standalone-server"
+      );
+    }
   }
 
   const confirmation = await vscode.window.showInformationMessage(

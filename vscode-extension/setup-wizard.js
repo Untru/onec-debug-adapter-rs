@@ -338,6 +338,7 @@ function configurationSummary(configuration) {
   const lines = [
     `Название: ${configuration.name}`,
     `Режим: ${configuration.request === "launch" ? "запуск" : "подключение"}`,
+    `Способ запуска: ${configuration.launchMode === "standaloneServer" ? "автономный сервер (ibsrv)" : "обычный клиент 1С"}`,
     `Исходники конфигурации: ${configuration.rootProject}`,
     `Информационная база: ${configuration.infoBase}`
   ];
@@ -347,6 +348,11 @@ function configurationSummary(configuration) {
   if (configuration.request === "launch") {
     lines.push(`Платформа: ${configuration.platformPath}`);
     lines.push(`Версия платформы: ${configuration.platformVersion}`);
+  }
+  if (configuration.launchMode === "standaloneServer") {
+    lines.push(`HTTP автономного сервера: ${configuration.standaloneServerHost}:${configuration.standaloneServerPort}${configuration.standaloneServerBase}`);
+    lines.push(`Порты автономного сервера: direct ${configuration.standaloneServerDirectRegPort} (${configuration.standaloneServerDirectRange}), SSH ${configuration.standaloneServerSshPort}`);
+    lines.push(`Данные автономного сервера: ${configuration.standaloneServerDataPath}`);
   }
   lines.push(`Сервер отладки: ${configuration.debugServerHost}:${configuration.debugServerPort}`);
   lines.push(`Автоподключение: ${configuration.autoAttachTypes.join(", ")}`);
