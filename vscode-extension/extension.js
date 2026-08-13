@@ -2,12 +2,17 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vscode = require("vscode");
 const {
+  canonicalDirectory,
   configurationSummary,
+  defaultPlatformRoots,
+  discoverPlatformDirectories,
   hasCredentials,
   isSamePath,
   noExtensionSourceChoices,
   parseExtensionName,
-  uniqueConfigurationName
+  uniqueConfigurationName,
+  isPlatformVersionDirectory,
+  validatePlatformDirectory
 } = require("./setup-wizard");
 
 const IGNORED_DISCOVERY_DIRECTORIES = new Set([
@@ -49,15 +54,6 @@ function configuredAutoAttachTypes(session) {
   return Array.isArray(configuration?.autoAttachTypes)
     ? configuration.autoAttachTypes
     : [];
-}
-
-async function canonicalDirectory(directory) {
-  const canonical = await fs.promises.realpath(directory);
-  const stat = await fs.promises.stat(canonical);
-  if (!stat.isDirectory()) {
-    throw new Error("Укажите каталог, а не файл.");
-  }
-  return canonical;
 }
 
 async function configurationRoot(directory) {
@@ -376,47 +372,33 @@ async function chooseLaunchInfoBase(workspaceFolder) {
   }
 }
 
-function platformExecutables() {
-  const suffix = process.platform === "win32" ? ".exe" : "";
-  return { client: `1cv8c${suffix}`, debugServer: `dbgs${suffix}` };
-}
-
-async function containsPlatformBinaries(directory) {
-  const { client, debugServer } = platformExecutables();
-  const [clientStat, serverStat] = await Promise.all(
-    [client, debugServer].map((name) => fs.promises.stat(path.join(directory, name)).catch(() => undefined))
-  );
-  return Boolean(clientStat?.isFile() && serverStat?.isFile());
-}
-
-function isPlatformVersionDirectory(name) {
-  return name.split(".").every((part) => /^\d+$/.test(part));
-}
-
-function platformBinaryDirectory(versionDirectory) {
-  return process.platform === "win32" ? path.join(versionDirectory, "bin") : versionDirectory;
-}
-
-async function validatePlatformDirectory(directory) {
-  const root = await canonicalDirectory(directory);
-  if (await containsPlatformBinaries(root)) return root;
-  const children = await fs.promises.readdir(root, { withFileTypes: true });
-  const candidates = await Promise.all(
-    children
-      .filter((entry) => entry.isDirectory() && isPlatformVersionDirectory(entry.name))
-      .map(async (entry) => {
-        const child = platformBinaryDirectory(path.join(root, entry.name));
-        return (await containsPlatformBinaries(child)) ? child : undefined;
-      })
-  );
-  if (candidates.some(Boolean)) return root;
-  const { client, debugServer } = platformExecutables();
-  throw new Error(`Не найдены ${client} и ${debugServer} ни в каталоге, ни в его каталогах версий.`);
-}
-
 async function choosePlatformDirectory(workspaceFolder) {
+  const discovered = await discoverPlatformDirectories();
+  const choices = [
+    ...discovered.map((directory, index) => ({
+      label: `$(tools) ${directory}`,
+      description: index === 0 ? "Рекомендуется: содержит 1cv8c и dbgs" : "Содержит 1cv8c и dbgs",
+      directory
+    })),
+    {
+      label: "$(folder-opened) Выбрать другой каталог…",
+      description: "Для запуска нужны 1cv8c и dbgs",
+      browse: true
+    }
+  ];
+  const defaultRoot = defaultPlatformRoots()[0];
   while (true) {
-    const selected = await pickDirectory("1C: Каталог платформы 1С", workspaceFolder.uri);
+    const picked = await vscode.window.showQuickPick(choices, {
+      title: "1C: Платформа 1С для запуска",
+      placeHolder: "Выберите каталог, содержащий 1cv8c и dbgs"
+    });
+    if (!picked) return undefined;
+    const selected = picked.browse
+      ? await pickDirectory(
+        "1C: Каталог платформы 1С",
+        defaultRoot ? vscode.Uri.file(defaultRoot) : workspaceFolder.uri
+      )
+      : [picked.directory];
     if (!selected) return undefined;
     try {
       return await validatePlatformDirectory(selected[0]);

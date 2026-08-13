@@ -1,11 +1,16 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
 const test = require("node:test");
 const {
+  discoverPlatformDirectories,
   hasCredentials,
   isSamePath,
   noExtensionSourceChoices,
   parseExtensionName,
-  uniqueConfigurationName
+  uniqueConfigurationName,
+  validatePlatformDirectory
 } = require("../setup-wizard");
 
 test("reads an extension name from Properties", () => {
@@ -41,4 +46,39 @@ test("offers an explicit continuation when no extension sources are found", () =
   assert.equal(choices[0].label, "Продолжить без расширений");
   assert.equal(choices[0].continueWithoutExtensions, true);
   assert.equal(choices[1].browse, true);
+});
+
+test("discovers a runnable macOS platform under /opt/1cv8", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-platform-"));
+  const platformRoot = path.join(temporary, "opt", "1cv8");
+  const versionRoot = path.join(platformRoot, "8.3.27.1508");
+  await fs.mkdir(versionRoot, { recursive: true });
+  await Promise.all(["1cv8c", "dbgs"].map((name) => fs.writeFile(path.join(versionRoot, name), "")));
+
+  try {
+    const discovered = await discoverPlatformDirectories({ platform: "darwin", roots: [platformRoot] });
+    assert.deepEqual(discovered, [await fs.realpath(versionRoot)]);
+    assert.equal(
+      await validatePlatformDirectory(platformRoot, { platform: "darwin" }),
+      await fs.realpath(platformRoot)
+    );
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test("rejects a macOS GUI application bundle as a launch platform", async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), "onec-platform-app-"));
+  const bundle = path.join(temporary, "1cv8.app", "Contents", "MacOS");
+  await fs.mkdir(bundle, { recursive: true });
+  await fs.writeFile(path.join(bundle, "1cv8"), "");
+
+  try {
+    await assert.rejects(
+      validatePlatformDirectory(bundle, { platform: "darwin" }),
+      /\/opt\/1cv8\/<версия>/
+    );
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
 });
