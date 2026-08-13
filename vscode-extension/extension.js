@@ -456,6 +456,31 @@ async function chooseLaunchMode(selectedInfoBase, request) {
   return selected?.mode;
 }
 
+async function chooseStandaloneTransport(launchMode) {
+  if (launchMode !== "standaloneServer") return undefined;
+  const selected = await vscode.window.showQuickPick(
+    [
+      {
+        label: "Прямое соединение тонкого клиента (рекомендуется)",
+        description: "TCP/IP через шлюз ibsrv; не использует HTTP-страницу входа",
+        detail: "Тонкий клиент подключится к локальному автономному серверу напрямую.",
+        transport: "direct"
+      },
+      {
+        label: "HTTP-соединение тонкого клиента",
+        description: "Тонкий клиент через /WS и встроенный HTTP-шлюз ibsrv",
+        detail: "Нужно, только если требуется проверить именно HTTP-публикацию.",
+        transport: "http"
+      }
+    ],
+    {
+      title: "1C: Подключение тонкого клиента к автономному серверу",
+      placeHolder: "Выберите транспорт клиента"
+    }
+  );
+  return selected?.transport;
+}
+
 async function firstAvailableLocalPort(first = 8314, last = 8399) {
   for (let port = first; port <= last; port += 1) {
     const available = await new Promise((resolve) => {
@@ -732,6 +757,8 @@ async function configureDebugger() {
   if (!request) return;
   const launchMode = await chooseLaunchMode(selectedInfoBase, request);
   if (!launchMode) return;
+  const standaloneTransport = await chooseStandaloneTransport(launchMode);
+  if (launchMode === "standaloneServer" && !standaloneTransport) return;
 
   const debugServer = await chooseDebugServer();
   if (!debugServer) return;
@@ -768,8 +795,10 @@ async function configureDebugger() {
       configuration.standaloneServerHost = "127.0.0.1";
       configuration.standaloneServerPort = standaloneServerPort;
       configuration.standaloneServerBase = "/";
+      configuration.standaloneServerTransport = standaloneTransport;
       configuration.standaloneServerDirectRegPort = 1941;
       configuration.standaloneServerDirectRange = "1960:1991";
+      configuration.standaloneServerName = `onec-debug-${configuration.standaloneServerDirectRegPort}`;
       configuration.standaloneServerDataPath = path.join(
         workspaceFolder.uri.fsPath,
         ".vscode",

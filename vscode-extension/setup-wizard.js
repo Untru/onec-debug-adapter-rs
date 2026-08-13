@@ -356,6 +356,7 @@ function configurationSummary(configuration) {
       ? `, SSH ${configuration.standaloneServerSshPort}`
       : "";
     lines.push(`Порты автономного сервера: ${directPorts}${sshPort}`);
+    lines.push(`Транспорт тонкого клиента: ${configuration.standaloneServerTransport === "http" ? "HTTP (/WS)" : `прямой TCP/IP (${configuration.standaloneServerName || "имя сервера"})`}`);
     lines.push(`Данные автономного сервера: ${configuration.standaloneServerDataPath}`);
   }
   lines.push(`Сервер отладки: ${configuration.debugServerHost}:${configuration.debugServerPort}`);

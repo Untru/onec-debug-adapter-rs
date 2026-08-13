@@ -67,12 +67,15 @@ test("summarizes the standalone server launch mode", () => {
     standaloneServerHost: "localhost",
     standaloneServerPort: 8314,
     standaloneServerBase: "/",
+    standaloneServerTransport: "direct",
+    standaloneServerName: "onec-debug-1941",
     standaloneServerDirectRegPort: 1941,
     standaloneServerDirectRange: "1960:1991",
     standaloneServerDataPath: "/work/.vscode/onec-standalone-server",
     autoAttachTypes: ["ManagedClient", "Server"]
   });
   assert.match(summary, /автономный сервер \(ibsrv\)/);
+  assert.match(summary, /прямой TCP\/IP \(onec-debug-1941\)/);
   assert.match(summary, /localhost:8314\//);
   assert.doesNotMatch(summary, /SSH/);
 });

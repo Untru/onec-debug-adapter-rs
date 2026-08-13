@@ -223,6 +223,9 @@ struct ConnectionArguments {
     standalone_server_port: Option<u16>,
     standalone_server_base: Option<String>,
     standalone_server_data_path: Option<String>,
+    #[serde(default)]
+    standalone_server_transport: StandaloneServerTransport,
+    standalone_server_name: Option<String>,
     standalone_server_direct_reg_port: Option<u16>,
     standalone_server_direct_range: Option<String>,
     standalone_server_ssh_port: Option<u16>,
@@ -236,13 +239,25 @@ struct ConnectionArguments {
 /// The process that owns the application being debugged. `client` keeps the
 /// established behaviour: start a local `dbgs` for a file base and then start
 /// `1cv8c`. `standaloneServer` starts `ibsrv`, then starts the thin client
-/// against its HTTP endpoint.
+/// against either its direct TCP/IP gateway or its HTTP endpoint.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 enum LaunchMode {
     #[default]
     Client,
     StandaloneServer,
+}
+
+/// Transport used by a thin client after the adapter starts `ibsrv`.
+///
+/// Direct TCP/IP is the safer local default: it avoids the HTTP login route
+/// while still using the thin client (not the browser web client).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum StandaloneServerTransport {
+    #[default]
+    Direct,
+    Http,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -302,10 +317,17 @@ fn launch_debuggee(
     let mut command = Command::new(&executable);
     command.arg("ENTERPRISE");
     if arguments.launch_mode == LaunchMode::StandaloneServer {
-        // The platform syntax is one token: `/WS"http://host:port"`.
-        // Passing `/WS` and the URL separately starts a client, but it does
-        // not form the standalone-server HTTP session correctly.
-        command.arg(format!("/WS{}", standalone_server_url(arguments)));
+        match arguments.standalone_server_transport {
+            StandaloneServerTransport::Direct => {
+                command.arg(standalone_server_direct_connection(arguments));
+            }
+            StandaloneServerTransport::Http => {
+                // The platform syntax is one token: `/WS"http://host:port"`.
+                // Passing `/WS` and the URL separately starts a client, but it does
+                // not form the standalone-server HTTP session correctly.
+                command.arg(format!("/WS{}", standalone_server_url(arguments)));
+            }
+        }
     } else if let Some(path) = &info_base_target.direct_file_path {
         command.arg("/F").arg(path);
     } else {
@@ -353,6 +375,34 @@ fn standalone_server_url(arguments: &ConnectionArguments) -> String {
         Some(base) => format!("http://{host}:{port}/{base}"),
         None => format!("http://{host}:{port}"),
     }
+}
+
+fn standalone_server_name(arguments: &ConnectionArguments) -> String {
+    arguments
+        .standalone_server_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            format!(
+                "onec-debug-{}",
+                arguments.standalone_server_direct_reg_port.unwrap_or(1941)
+            )
+        })
+}
+
+fn standalone_server_direct_connection(arguments: &ConnectionArguments) -> String {
+    let host = arguments
+        .standalone_server_host
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("127.0.0.1");
+    let registration_port = arguments.standalone_server_direct_reg_port.unwrap_or(1941);
+    format!(
+        "/S{host}:{registration_port}\\{}",
+        standalone_server_name(arguments)
+    )
 }
 
 fn launch_standalone_server(
@@ -423,6 +473,7 @@ fn launch_standalone_server(
         .arg(format!("--http-address={http_host}"))
         .arg(format!("--http-port={http_port}"))
         .arg(format!("--http-base={http_base}"))
+        .arg(format!("--name={}", standalone_server_name(arguments)))
         .arg(format!("--direct-regport={direct_registration_port}"))
         .arg(format!("--direct-range={direct_range}"));
     if let Some(ssh_port) = arguments.standalone_server_ssh_port {
@@ -2559,6 +2610,8 @@ mod tests {
                     standalone_server_port: None,
                     standalone_server_base: None,
                     standalone_server_data_path: None,
+                    standalone_server_transport: StandaloneServerTransport::Direct,
+                    standalone_server_name: None,
                     standalone_server_direct_reg_port: None,
                     standalone_server_direct_range: None,
                     standalone_server_ssh_port: None,
@@ -2880,6 +2933,8 @@ Connect=File="/tmp/demo";
             "standaloneServerPort": 8315,
             "standaloneServerBase": "/demo",
             "standaloneServerDataPath": "/tmp/standalone-state",
+            "standaloneServerTransport": "direct",
+            "standaloneServerName": "onec-test",
             "standaloneServerDirectRegPort": 1941,
             "standaloneServerDirectRange": "1960:1991",
             "standaloneServerSshPort": 1943
@@ -2892,6 +2947,14 @@ Connect=File="/tmp/demo";
         );
         assert_eq!(arguments.standalone_server_port, Some(8315));
         assert_eq!(arguments.standalone_server_base.as_deref(), Some("/demo"));
+        assert_eq!(
+            arguments.standalone_server_transport,
+            StandaloneServerTransport::Direct
+        );
+        assert_eq!(
+            arguments.standalone_server_name.as_deref(),
+            Some("onec-test")
+        );
         assert_eq!(
             arguments.standalone_server_data_path.as_deref(),
             Some("/tmp/standalone-state")
@@ -2916,6 +2979,10 @@ Connect=File="/tmp/demo";
         }))
         .unwrap();
         assert_eq!(standalone_server_url(&root), "http://127.0.0.1:8315");
+        assert_eq!(
+            standalone_server_direct_connection(&root),
+            "/S127.0.0.1:1941\\onec-debug-1941"
+        );
 
         let published: ConnectionArguments = serde_json::from_value(json!({
             "standaloneServerHost": "localhost",
@@ -3068,6 +3135,8 @@ Connect=File="/tmp/demo";
             standalone_server_port: None,
             standalone_server_base: None,
             standalone_server_data_path: None,
+            standalone_server_transport: StandaloneServerTransport::Direct,
+            standalone_server_name: None,
             standalone_server_direct_reg_port: None,
             standalone_server_direct_range: None,
             standalone_server_ssh_port: None,
@@ -3106,6 +3175,8 @@ Connect=File="/tmp/demo";
             standalone_server_port: None,
             standalone_server_base: None,
             standalone_server_data_path: None,
+            standalone_server_transport: StandaloneServerTransport::Direct,
+            standalone_server_name: None,
             standalone_server_direct_reg_port: None,
             standalone_server_direct_range: None,
             standalone_server_ssh_port: None,
