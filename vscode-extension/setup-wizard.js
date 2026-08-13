@@ -4,8 +4,7 @@ const fs = require("node:fs");
 const CREDENTIAL_PATTERN = /(?:^|[;\s])(pwd|password|usr|user)\s*=/i;
 
 // `ibases.v8i` is an INI-like file maintained by the 1C launcher.  It is not
-// a credentials store for the wizard: entries that carry credentials are
-// deliberately ignored instead of being copied to launch.json.
+// a credentials store for the wizard: only safe identity fields are exposed.
 const IBASE_SECTION_PATTERN = /^\s*\[([^\]]+)\]\s*$/;
 
 function parseExtensionName(xml) {
@@ -48,7 +47,7 @@ function parseIbaseV8i(contents) {
   let name;
   let connect;
   const finish = () => {
-    if (!name || !connect || hasCredentials(connect)) return;
+    if (!name || !connect) return;
     const filePath = connectionProperty(connect, "File");
     const server = connectionProperty(connect, "Srvr");
     const reference = connectionProperty(connect, "Ref");
@@ -57,7 +56,10 @@ function parseIbaseV8i(contents) {
       kind: filePath ? "file" : (server && reference ? "server" : "unknown"),
       filePath,
       server,
-      reference
+      reference,
+      // This is only a UI hint.  No user name, password or connection string
+      // leaves this parser; launch.json will contain the registration name.
+      hasStoredCredentials: hasCredentials(connect)
     });
   };
   for (const rawLine of contents.split(/\r?\n/)) {
