@@ -34,11 +34,58 @@ pub struct ModuleRegistry {
 
 impl ModuleRegistry {
     pub fn load(root_project: &Path, extensions: &[PathBuf]) -> Result<Self> {
+        let root_project = root_project.canonicalize().with_context(|| {
+            format!(
+                "cannot resolve base configuration source directory {}",
+                root_project.display()
+            )
+        })?;
         let mut registry = Self::default();
-        registry.scan_root(root_project, "")?;
+        registry.scan_root(&root_project, "")?;
+
+        let mut extension_paths = HashMap::<PathBuf, PathBuf>::new();
+        let mut extension_names = HashMap::<String, PathBuf>::new();
         for extension_path in extensions {
-            let extension_name = configuration_name(extension_path)?;
-            registry.scan_root(extension_path, &extension_name)?;
+            let canonical_path = extension_path.canonicalize().with_context(|| {
+                format!(
+                    "cannot resolve extension configuration source directory {}",
+                    extension_path.display()
+                )
+            })?;
+            let extension_name = configuration_name(&canonical_path)?;
+
+            if canonical_path == root_project {
+                bail!(
+                    "extension configuration source {} is the same as base configuration source {}",
+                    extension_path.display(),
+                    root_project.display()
+                );
+            }
+            if let Some(previous_path) = extension_paths.get(&canonical_path) {
+                bail!(
+                    "extension configuration {} ({}) duplicates extension configuration {} ({})",
+                    extension_path.display(),
+                    extension_name,
+                    previous_path.display(),
+                    extension_name
+                );
+            }
+            if !extension_name.trim().is_empty()
+                && let Some(previous_path) = extension_names.get(&extension_name)
+            {
+                bail!(
+                    "extension configurations {} and {} have the same logical name {:?}",
+                    previous_path.display(),
+                    canonical_path.display(),
+                    extension_name
+                );
+            }
+
+            extension_paths.insert(canonical_path.clone(), extension_path.clone());
+            if !extension_name.trim().is_empty() {
+                extension_names.insert(extension_name.clone(), canonical_path.clone());
+            }
+            registry.scan_root(&canonical_path, &extension_name)?;
         }
         Ok(registry)
     }
@@ -169,14 +216,22 @@ impl ModuleRegistry {
             object_id: object_id.to_owned(),
             property_id: property_id.to_owned(),
         };
-        self.by_identity.insert(
-            (
-                info.extension_name.clone(),
-                info.object_id.clone(),
-                info.property_id.clone(),
-            ),
-            canonical_path.clone(),
+        let identity = (
+            info.extension_name.clone(),
+            info.object_id.clone(),
+            info.property_id.clone(),
         );
+        if let Some(previous_path) = self.by_identity.get(&identity) {
+            bail!(
+                "module identity collision for extension {:?}, object {}, property {}: {} and {}",
+                info.extension_name,
+                info.object_id,
+                info.property_id,
+                previous_path.display(),
+                canonical_path.display()
+            );
+        }
+        self.by_identity.insert(identity, canonical_path.clone());
         self.by_path.insert(canonical_path, info);
         Ok(())
     }
@@ -294,13 +349,23 @@ mod tests {
         fs::write(path, contents).unwrap();
     }
 
-    #[test]
-    fn maps_root_and_common_modules() {
-        let root = std::env::temp_dir().join(format!("onec-debug-adapter-{}", Uuid::new_v4()));
+    fn temporary_root() -> PathBuf {
+        std::env::temp_dir().join(format!("onec-debug-adapter-{}", Uuid::new_v4()))
+    }
+
+    fn write_configuration(root: &Path, name: &str, uuid: &str) {
         write(
             &root.join("Configuration.xml"),
-            "<MetaDataObject><Configuration uuid=\"config-uuid\"><Properties><Name>Demo</Name></Properties></Configuration></MetaDataObject>",
+            &format!(
+                "<MetaDataObject><Configuration uuid=\"{uuid}\"><Properties><Name>{name}</Name></Properties></Configuration></MetaDataObject>"
+            ),
         );
+    }
+
+    #[test]
+    fn maps_root_and_common_modules() {
+        let root = temporary_root();
+        write_configuration(&root, "Demo", "config-uuid");
         write(&root.join("Ext/ManagedApplicationModule.bsl"), "");
         write(
             &root.join("CommonModules/Tools.xml"),
@@ -332,6 +397,132 @@ mod tests {
                 .unwrap()
         );
 
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_extension_equal_to_base_configuration() {
+        let root = temporary_root();
+        write_configuration(&root, "Demo", "config-uuid");
+
+        let error = ModuleRegistry::load(&root, std::slice::from_ref(&root))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("same as base configuration source"));
+        assert!(error.contains(&root.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_duplicate_extension_canonical_path() {
+        let root = temporary_root();
+        let extension = root.join("Extension");
+        write_configuration(&root, "Demo", "config-uuid");
+        write_configuration(&extension, "Extension", "extension-uuid");
+        let duplicate_spelling = extension.join(".");
+
+        let error = ModuleRegistry::load(&root, &[extension.clone(), duplicate_spelling.clone()])
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("duplicates extension configuration"));
+        assert!(error.contains(&extension.display().to_string()));
+        assert!(error.contains(&duplicate_spelling.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_extensions_with_duplicate_logical_name() {
+        let root = temporary_root();
+        let first_extension = root.join("FirstExtension");
+        let second_extension = root.join("SecondExtension");
+        write_configuration(&root, "Demo", "config-uuid");
+        write_configuration(&first_extension, "SharedExtension", "extension-one-uuid");
+        write_configuration(&second_extension, "SharedExtension", "extension-two-uuid");
+
+        let error =
+            ModuleRegistry::load(&root, &[first_extension.clone(), second_extension.clone()])
+                .unwrap_err()
+                .to_string();
+
+        assert!(error.contains("same logical name \"SharedExtension\""));
+        assert!(error.contains(&first_extension.display().to_string()));
+        assert!(error.contains(&second_extension.display().to_string()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_module_identity_collision() {
+        let root = temporary_root();
+        write_configuration(&root, "Demo", "config-uuid");
+        write(
+            &root.join("CommonModules/First.xml"),
+            "<MetaDataObject><CommonModule uuid=\"shared-uuid\" /></MetaDataObject>",
+        );
+        write(&root.join("CommonModules/First/Ext/Module.bsl"), "");
+        write(
+            &root.join("CommonModules/Second.xml"),
+            "<MetaDataObject><CommonModule uuid=\"shared-uuid\" /></MetaDataObject>",
+        );
+        write(&root.join("CommonModules/Second/Ext/Module.bsl"), "");
+
+        let error = ModuleRegistry::load(&root, &[]).unwrap_err().to_string();
+
+        assert!(error.contains("module identity collision"));
+        assert!(error.contains("extension \"\""));
+        assert!(error.contains("First/Ext/Module.bsl"));
+        assert!(error.contains("Second/Ext/Module.bsl"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supports_multiple_distinct_extensions() {
+        let root = temporary_root();
+        let first_extension = root.join("FirstExtension");
+        let second_extension = root.join("SecondExtension");
+        write_configuration(&root, "Demo", "config-uuid");
+        write_configuration(&first_extension, "First", "extension-one-uuid");
+        write_configuration(&second_extension, "Second", "extension-two-uuid");
+        write(
+            &first_extension.join("Ext/ManagedApplicationModule.bsl"),
+            "",
+        );
+        write(
+            &second_extension.join("Ext/ManagedApplicationModule.bsl"),
+            "",
+        );
+
+        let registry =
+            ModuleRegistry::load(&root, &[first_extension.clone(), second_extension.clone()])
+                .unwrap();
+
+        assert_eq!(
+            registry
+                .path_by_module(
+                    "First",
+                    "extension-one-uuid",
+                    MANAGED_APPLICATION_MODULE_PROPERTY_ID
+                )
+                .unwrap(),
+            first_extension
+                .join("Ext/ManagedApplicationModule.bsl")
+                .canonicalize()
+                .unwrap()
+        );
+        assert_eq!(
+            registry
+                .path_by_module(
+                    "Second",
+                    "extension-two-uuid",
+                    MANAGED_APPLICATION_MODULE_PROPERTY_ID
+                )
+                .unwrap(),
+            second_extension
+                .join("Ext/ManagedApplicationModule.bsl")
+                .canonicalize()
+                .unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }
